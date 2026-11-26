@@ -49,7 +49,7 @@ fn main(
     }
     let part = lane % LANES;
     let total = shape.rows * shape.blocks_per_row;
-    let first = row * shape.blocks_per_row;
+    let weights = weight_row(row, shape.rows, shape.blocks_per_row);
     var start = 0u;
     var count = batch[0];
     if shape.head != 0u {
@@ -59,6 +59,7 @@ fn main(
 
     let n = shape.blocks_per_row;
     let step = 32u / LANES;
+    let weight_step = step * weights.y;
     let out = shape.offset + row;
     var t = 0u;
     // four tokens at a time share each weight load; every token's sum runs
@@ -69,10 +70,12 @@ fn main(
         var sum = vec4<f32>(0.0);
         var b = lane / LANES;
         for (; b + step < n; b += 2u * step) {
-            sum += dot4(total, first + b, xs + b, part) + dot4(total, first + b + step, xs + b + step, part);
+            let block = weights.x + b * weights.y;
+            sum += dot4(total, block, xs + b, part)
+                + dot4(total, block + weight_step, xs + b + step, part);
         }
         if b < n {
-            sum += dot4(total, first + b, xs + b, part);
+            sum += dot4(total, weights.x + b * weights.y, xs + b, part);
         }
         let all = vec4<f32>(subgroupAdd(sum.x), subgroupAdd(sum.y), subgroupAdd(sum.z), subgroupAdd(sum.w));
         if lane == 0u {
@@ -87,11 +90,12 @@ fn main(
         var b = lane / LANES;
         // two blocks per step keep two weight loads in flight
         for (; b + step < n; b += 2u * step) {
-            sum += block_dot(total, first + b, xb + b, part)
-                + block_dot(total, first + b + step, xb + b + step, part);
+            let block = weights.x + b * weights.y;
+            sum += block_dot(total, block, xb + b, part)
+                + block_dot(total, block + weight_step, xb + b + step, part);
         }
         if b < n {
-            sum += block_dot(total, first + b, xb + b, part);
+            sum += block_dot(total, weights.x + b * weights.y, xb + b, part);
         }
         sum = subgroupAdd(sum);
         if lane == 0u {

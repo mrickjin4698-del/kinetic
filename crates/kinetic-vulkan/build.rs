@@ -88,6 +88,18 @@ fn source(constants: &str, parts: &[&str], dirs: &[&str]) -> String {
         .join("\n")
 }
 
+fn vulkan_weight_source(constants: &str, parts: &[&str]) -> String {
+    let rows = if parts.contains(&"gemv_q8_0") || parts.contains(&"mm_q8_0") {
+        Q8_WEIGHT_ROWS
+    } else {
+        1
+    };
+    let mut parts = parts.to_vec();
+    parts.push("weight_rows");
+    let source = source(constants, &parts, &["shaders"]);
+    format!("{source}\nconst WEIGHT_ROWS: u32 = {rows}u;\n")
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=shaders");
     println!("cargo:rustc-check-cfg=cfg(metal_driver)");
@@ -98,7 +110,7 @@ fn main() {
     }
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"));
     for &(name, constants, parts) in MATRIX_KERNELS {
-        let source = source(constants, parts, &["shaders"]);
+        let source = vulkan_weight_source(constants, parts);
         for (kernel, (rows, tokens), packed) in [
             (name.to_owned(), MATRIX_TILE, false),
             (format!("{name}_wide"), MATRIX_WIDE_TILE, false),
@@ -120,7 +132,12 @@ fn main() {
     let (module, info) = parse_with("mm_pack", &pack, MATRIX_CAPABILITIES);
     fs::write(out.join("mm_pack.spv"), spirv("mm_pack", &module, &info)).expect("write SPIR-V");
     for &(name, constants, parts) in KERNELS {
-        let (module, info) = parse(name, &source(constants, parts, &["shaders"]));
+        let wgsl = if parts[0] == "gemv" {
+            vulkan_weight_source(constants, parts)
+        } else {
+            source(constants, parts, &["shaders"])
+        };
+        let (module, info) = parse(name, &wgsl);
         fs::write(out.join(format!("{name}.spv")), spirv(name, &module, &info))
             .expect("write SPIR-V");
         #[cfg(feature = "metal")]

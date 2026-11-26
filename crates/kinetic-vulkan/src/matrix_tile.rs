@@ -3,3 +3,5 @@
 pub(crate) const MATRIX_TILE: (usize, usize) = (64, 64);
 /// Reuses each token across twice as many weight rows for long passes.
 pub(crate) const MATRIX_WIDE_TILE: (usize, usize) = (128, 64);
+/// Q8 weight rows interleaved by block column in the Vulkan device layout.
+pub(crate) const Q8_WEIGHT_ROWS: usize = 4;

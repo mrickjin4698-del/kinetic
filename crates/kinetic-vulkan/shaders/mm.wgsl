@@ -119,6 +119,7 @@ fn main(
     let wr = tid / WEIGHT_LANES;
     let wh = tid % WEIGHT_LANES;
     let wrow = min(row0 + wr, shape.rows - 1u);
+    let weights = weight_row(wrow, shape.rows, n);
     let xr = tid / INPUT_LANES;
     let xh = tid % INPUT_LANES;
     let xrow = start + min(tok0 + xr, count - 1u);
@@ -156,7 +157,7 @@ fn main(
     var c13 = coop_mat16x16<f32, C>();
 
     for (var ks = 0u; ks < steps; ks++) {
-        let blk = wrow * n + ks / SUB;
+        let blk = weights.x + (ks / SUB) * weights.y;
         let sub = ks % SUB;
         stage(total, blk, sub, wh, wr * LD + wh * 4u);
         if WEIGHT_LANES == 1u {
