@@ -570,59 +570,65 @@ fn paired_prompt_attention_matches_single_queries() {
         if !gpu.kernels.matrix() {
             continue;
         }
-        let dev = &gpu.device;
-        let rows = 80;
-        let tokens = 73;
-        let start = 509;
-        let positions = start + rows;
-        let shape = AttentionShape {
-            n_head: 4,
-            n_head_kv: 2,
-            head_dim: 256,
-            rope_dims: 0,
-            rope_adjacent: false,
-            norm_after_rope: false,
-            gate: AttentionGate::PerValue,
-            window: None,
-            scale: 0.0625,
-            eps: 1e-5,
-        };
-        let mut rng = Lcg(317);
-        let mut cache = KvCache::new(dev, &shape, positions, rows).unwrap();
-        let mut plane = || {
-            (0..positions * shape.kv_dim())
-                .map(|_| f16::from_f32(rng.f32()).to_bits())
-                .collect::<Vec<_>>()
-        };
-        cache.load(0, &plane(), &plane()).unwrap();
-        let values: Vec<f32> = (0..rows * shape.qkv_len()).map(|_| rng.f32()).collect();
-        let qkv = DeviceBuffer::from_slice(dev, &values).unwrap();
-        let width = shape.n_head * shape.head_dim;
-        let out = GemvInput::batch(dev, width, rows).unwrap();
-        let mut batch = Batch::new(dev, rows, 0, positions, 0).unwrap();
-        batch.set(tokens, start, 0..0, None).unwrap();
+        for n_head in [4, 6] {
+            let dev = &gpu.device;
+            let rows = 80;
+            let tokens = 73;
+            let start = 509;
+            let positions = start + rows;
+            let shape = AttentionShape {
+                n_head,
+                n_head_kv: 2,
+                head_dim: 256,
+                rope_dims: 0,
+                rope_adjacent: false,
+                norm_after_rope: false,
+                gate: AttentionGate::PerValue,
+                window: None,
+                scale: 0.0625,
+                eps: 1e-5,
+            };
+            let mut rng = Lcg(317);
+            let mut cache = KvCache::new(dev, &shape, positions, rows).unwrap();
+            let mut plane = || {
+                (0..positions * shape.kv_dim())
+                    .map(|_| f16::from_f32(rng.f32()).to_bits())
+                    .collect::<Vec<_>>()
+            };
+            cache.load(0, &plane(), &plane()).unwrap();
+            let values: Vec<f32> = (0..rows * shape.qkv_len()).map(|_| rng.f32()).collect();
+            let qkv = DeviceBuffer::from_slice(dev, &values).unwrap();
+            let width = shape.n_head * shape.head_dim;
+            let out = GemvInput::batch(dev, width, rows).unwrap();
+            let mut batch = Batch::new(dev, rows, 0, positions, 0).unwrap();
+            batch.set(tokens, start, 0..0, None).unwrap();
 
-        let run = |shape, prompt| {
-            let mut commands = Commands::new(dev).unwrap();
-            commands.set_prompt(prompt);
-            batch.record_upload(&mut commands).unwrap();
-            gpu.kernels
-                .attend_prepared(&batch, shape, &qkv, &cache, &out, &mut commands)
-                .unwrap();
-            commands.submit().unwrap();
-            out.values().to_vec().unwrap()[..tokens * width].to_vec()
-        };
-        let window = AttentionShape {
-            window: Some(positions),
-            ..shape.clone()
-        };
-        let single = run(&shape, false);
-        let grouped = run(&window, true);
-        let paired = run(&shape, true);
-        for (kind, got) in [("grouped", grouped), ("paired", paired)] {
-            for (i, (&a, b)) in single.iter().zip(got).enumerate() {
-                assert!(a.is_finite());
-                assert_eq!(a.to_bits(), b.to_bits(), "{kind} attention at element {i}");
+            let run = |shape, prompt| {
+                let mut commands = Commands::new(dev).unwrap();
+                commands.set_prompt(prompt);
+                batch.record_upload(&mut commands).unwrap();
+                gpu.kernels
+                    .attend_prepared(&batch, shape, &qkv, &cache, &out, &mut commands)
+                    .unwrap();
+                commands.submit().unwrap();
+                out.values().to_vec().unwrap()[..tokens * width].to_vec()
+            };
+            let window = AttentionShape {
+                window: Some(positions),
+                ..shape.clone()
+            };
+            let single = run(&shape, false);
+            let grouped = run(&window, true);
+            let paired = run(&shape, true);
+            for (kind, got) in [("grouped", grouped), ("paired", paired)] {
+                for (i, (&a, b)) in single.iter().zip(got).enumerate() {
+                    assert!(a.is_finite());
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "{kind} attention with {n_head} heads at element {i}"
+                    );
+                }
             }
         }
     }

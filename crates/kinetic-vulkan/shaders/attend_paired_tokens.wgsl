@@ -1,14 +1,14 @@
-// Two consecutive prompt queries of one head share their initial KV loads.
-// They keep separate online softmax sums. As in the single query pass,
-// each subgroup visits every fourth position in increasing order.
+// Two consecutive prompt queries per head share their initial KV loads.
+// They keep separate online softmax sums. A workgroup can put two query
+// heads that use the same cache on one compute unit.
 const TOKEN_ROWS: u32 = 2u;
-const_assert HEADS == 1u;
+const_assert (HEADS == 1u || HEADS == 2u);
 
-@compute @workgroup_size(THREADS)
+@compute @workgroup_size(THREADS * HEADS)
 fn main(
     @builtin(workgroup_id) group: vec3<u32>,
-    @builtin(local_invocation_index) tid: u32,
-    @builtin(subgroup_id) slot: u32,
+    @builtin(local_invocation_index) local: u32,
+    @builtin(subgroup_id) subgroup: u32,
     @builtin(subgroup_invocation_id) lane: u32,
 ) {
     let t0 = group.y * TOKEN_ROWS;
@@ -17,7 +17,11 @@ fn main(
         return;
     }
     let t1 = min(t0 + 1u, count - 1u);
-    let head = group.x;
+    let in_group = subgroup / SUBGROUPS;
+    let part0 = in_group * TOKEN_ROWS * SUBGROUPS;
+    let slot = subgroup % SUBGROUPS;
+    let tid = select(local, slot * 32u + lane, HEADS > 1u);
+    let head = group.x * HEADS + in_group;
     let qb0 = t0 * shape.stride + head * shape.q_head_len;
     let qb1 = t1 * shape.stride + head * shape.q_head_len;
     let kv_head = head / (shape.n_head / shape.n_kv);
@@ -94,13 +98,13 @@ fn main(
         m1 = next;
     }
 
-    save_partial(0u, slot, lane, m0, l0, a0);
+    save_partial(part0, slot, lane, m0, l0, a0);
     if t1 != t0 {
-        save_partial(SUBGROUPS, slot, lane, m1, l1, a1);
+        save_partial(part0 + SUBGROUPS, slot, lane, m1, l1, a1);
     }
     workgroupBarrier();
     for (var t = t0; t <= t1; t++) {
-        let part = (t - t0) * SUBGROUPS;
+        let part = part0 + (t - t0) * SUBGROUPS;
         write_output(t, head, t * shape.stride + head * shape.q_head_len, part, tid, lane);
     }
 }

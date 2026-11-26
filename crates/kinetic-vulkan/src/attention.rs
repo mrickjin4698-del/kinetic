@@ -399,7 +399,10 @@ impl Kernels {
                 .as_ref()
                 .filter(|_| pair_tokens)
             {
-                Some(k) => (k, 1, 2),
+                Some(kernels) => {
+                    let heads = if pair_heads { 2 } else { 1 };
+                    (&kernels[heads - 1], heads, 2)
+                }
                 None => grouped
                     .filter(|_| pair_heads)
                     .map_or((single, 1, 1), |k| (k, 2, 1)),

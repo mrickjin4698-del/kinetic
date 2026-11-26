@@ -99,6 +99,16 @@ const KERNELS: &[(&str, &str, &[&str])] = &[
             "put_q8",
         ],
     ),
+    (
+        "attend_256_paired_tokens_grouped",
+        "const PAIRS: u32 = 4u; const HEADS: u32 = 2u;",
+        &[
+            "attend_packed",
+            "attend_shared",
+            "attend_paired_tokens",
+            "put_q8",
+        ],
+    ),
 ];
 
 /// Kernels on the matrix units, for devices with cooperative f16 matrices
