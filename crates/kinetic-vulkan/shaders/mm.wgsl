@@ -60,8 +60,9 @@ const LD: u32 = 10u;
 // weights [row][k] and inputs [token][k] of one step of 32 columns
 var<workgroup> wa: array<vec4<f16>, TILE_ROWS * LD>;
 var<workgroup> xb: array<vec4<f16>, TILE_TOKENS * LD>;
-// the finished tile, [token][row]
-var<workgroup> out: array<f32, OUT_TOKENS * TILE_ROWS>;
+// Pad the wide tile's output stride to spread cooperative stores across banks.
+const OUT_STRIDE: u32 = TILE_ROWS + select(0u, 4u, WIDE);
+var<workgroup> out: array<f32, OUT_TOKENS * OUT_STRIDE>;
 // the batch's first token and token count. Every variable here is a
 // multiple of 16 bytes: NVIDIA packs them without padding, and the matrix
 // loads and stores need addresses aligned to 16
@@ -79,10 +80,12 @@ fn f16_at(base: u32, i: u32) -> f32 {
 
 fn write_tile(row0: u32, tok0: u32, first: u32, count: u32, tid: u32) {
     for (var i = tid; i < OUT_TOKENS * TILE_ROWS; i += THREADS) {
-        let row = row0 + i % TILE_ROWS;
-        let t = first + i / TILE_ROWS;
+        let r = i % TILE_ROWS;
+        let token = i / TILE_ROWS;
+        let row = row0 + r;
+        let t = first + token;
         if row < shape.rows && tok0 + t < count {
-            y[(tok0 + t) * shape.stride + shape.offset + row] = out[i] * scale[t];
+            y[(tok0 + t) * shape.stride + shape.offset + row] = out[token * OUT_STRIDE + r] * scale[t];
         }
     }
 }
@@ -198,30 +201,30 @@ fn main(
     }
 
     // out[token][row]: column-major stores of the row-by-token products
-    let left = qt * TILE_ROWS + qr;
-    let right = left + 16u * TILE_ROWS;
-    coopStore(c00, &out[left], TILE_ROWS);
-    coopStore(c10, &out[left + 16u], TILE_ROWS);
+    let left = qt * OUT_STRIDE + qr;
+    let right = left + 16u * OUT_STRIDE;
+    coopStore(c00, &out[left], OUT_STRIDE);
+    coopStore(c10, &out[left + 16u], OUT_STRIDE);
     if OUT_TOKENS == TILE_TOKENS {
-        coopStore(c01, &out[right], TILE_ROWS);
-        coopStore(c11, &out[right + 16u], TILE_ROWS);
+        coopStore(c01, &out[right], OUT_STRIDE);
+        coopStore(c11, &out[right + 16u], OUT_STRIDE);
     }
     workgroupBarrier();
     write_tile(row0, tok0, 0u, count, tid);
     if WIDE {
         workgroupBarrier();
-        coopStore(c01, &out[left], TILE_ROWS);
-        coopStore(c11, &out[left + 16u], TILE_ROWS);
+        coopStore(c01, &out[left], OUT_STRIDE);
+        coopStore(c11, &out[left + 16u], OUT_STRIDE);
         workgroupBarrier();
         write_tile(row0, tok0, 16u, count, tid);
         workgroupBarrier();
-        coopStore(c02, &out[left], TILE_ROWS);
-        coopStore(c12, &out[left + 16u], TILE_ROWS);
+        coopStore(c02, &out[left], OUT_STRIDE);
+        coopStore(c12, &out[left + 16u], OUT_STRIDE);
         workgroupBarrier();
         write_tile(row0, tok0, 32u, count, tid);
         workgroupBarrier();
-        coopStore(c03, &out[left], TILE_ROWS);
-        coopStore(c13, &out[left + 16u], TILE_ROWS);
+        coopStore(c03, &out[left], OUT_STRIDE);
+        coopStore(c13, &out[left + 16u], OUT_STRIDE);
         workgroupBarrier();
         write_tile(row0, tok0, 48u, count, tid);
     }
