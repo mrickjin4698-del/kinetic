@@ -65,6 +65,7 @@ pub struct Kernels {
     pub(crate) attend_64: Rc<Kernel>,
     pub(crate) attend_128: Rc<Kernel>,
     pub(crate) attend_256: Rc<Kernel>,
+    pub(crate) attend_256_grouped: Option<Rc<Kernel>>,
     read_sum: Rc<Kernel>,
     /// The batch words of a pass of one token, for GEMVs outside a model.
     pub(crate) single: DeviceBuffer<u32>,
@@ -128,10 +129,7 @@ impl Kernels {
     pub fn load_with(device: &Rc<Device>, matrix: bool) -> Result<Kernels> {
         let gemv = |name: &str, spirv| Kernel::new(device, name, spirv, 6, 5);
         let attend = |name, spirv| Kernel::new(device, name, spirv, 7, 9);
-        #[cfg(not(metal_driver))]
-        let matrix = matrix && device.info().features.matrix_f16;
-        #[cfg(metal_driver)]
-        let _ = matrix;
+        let matrix = cfg!(not(metal_driver)) && matrix && device.info().features.matrix_f16;
         Ok(Kernels {
             gemv_f32: gemv("gemv_f32", spirv!("gemv_f32"))?,
             gemv_f16: gemv("gemv_f16", spirv!("gemv_f16"))?,
@@ -194,6 +192,9 @@ impl Kernels {
             attend_64: attend("attend_64", spirv!("attend_64"))?,
             attend_128: attend("attend_128", spirv!("attend_128"))?,
             attend_256: attend("attend_256", spirv!("attend_256"))?,
+            attend_256_grouped: matrix
+                .then(|| attend("attend_256_grouped", spirv!("attend_256_grouped")))
+                .transpose()?,
             read_sum: Kernel::new(device, "read_sum", spirv!("read_sum"), 2, 1)?,
             single: DeviceBuffer::from_slice(device, &[1, 0, 0, 1])?,
         })

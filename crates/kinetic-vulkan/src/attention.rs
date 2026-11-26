@@ -226,10 +226,16 @@ impl Kernels {
             AttentionGate::PerValue => 1,
             AttentionGate::PerHead => 2,
         };
-        let attend = match hd {
-            64 => &self.attend_64,
-            128 => &self.attend_128,
-            _ => &self.attend_256,
+        // Pair consecutive query heads within each KV head.
+        let pair_heads = commands.prompt() && (shape.n_head / shape.n_head_kv).is_multiple_of(2);
+        let (attend, heads) = match hd {
+            64 => (&self.attend_64, 1),
+            128 => (&self.attend_128, 1),
+            _ if pair_heads => self
+                .attend_256_grouped
+                .as_ref()
+                .map_or((&self.attend_256, 1), |k| (k, 2)),
+            _ => (&self.attend_256, 1),
         };
         let batch_words = batch.device().allocation();
         let [ox, oq, od] = out.outputs();
@@ -289,7 +295,7 @@ impl Kernels {
                     shape.window.map_or(u32::MAX, |w| w as u32),
                     cache.slots as u32,
                 ],
-                [shape.n_head as u32, rows as u32, 1],
+                [(shape.n_head / heads) as u32, rows as u32, 1],
             );
         }
         Ok(())

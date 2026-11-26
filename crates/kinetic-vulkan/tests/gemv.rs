@@ -493,11 +493,17 @@ fn sliding_attention_matches_contiguous_cache() {
     for gpu in gpus() {
         let positions = 20;
         let mut rng = Lcg(1);
-        for window in [1, 3, 6] {
+        for (window, n_head, n_head_kv, head_dim) in [
+            (1, 2, 1, 64),
+            (3, 2, 1, 64),
+            (6, 2, 1, 64),
+            (9, 4, 2, 256),
+            (6, 6, 2, 256),
+        ] {
             let shape = AttentionShape {
-                n_head: 2,
-                n_head_kv: 1,
-                head_dim: 64,
+                n_head,
+                n_head_kv,
+                head_dim,
                 rope_dims: 0,
                 rope_adjacent: false,
                 norm_after_rope: false,
@@ -525,9 +531,10 @@ fn sliding_attention_matches_contiguous_cache() {
             for pos in 0..positions {
                 let input: Vec<_> = (0..shape.qkv_len()).map(|_| rng.f32()).collect();
                 batch.set(1, pos, 0..0, None).unwrap();
-                let mut attend = |cache| {
+                let mut attend = |cache, prompt| {
                     qkv.copy_from(&input).unwrap();
                     let mut commands = Commands::new(&gpu.device).unwrap();
+                    commands.set_prompt(prompt);
                     batch.record_upload(&mut commands).unwrap();
                     gpu.kernels
                         .attention(&batch, &shape, &qkv, &consts, 0, cache, &out, &mut commands)
@@ -535,16 +542,18 @@ fn sliding_attention_matches_contiguous_cache() {
                     commands.submit().unwrap();
                     out.values().to_vec().unwrap()
                 };
-                let wrapped = attend(&ring);
-                let contiguous = attend(&full);
+                let contiguous = attend(&full, false);
                 assert!(contiguous.iter().any(|&v| v != 0.0));
-                for (i, (&a, &b)) in wrapped.iter().zip(&contiguous).enumerate() {
-                    assert!(b.is_finite());
-                    assert_eq!(
-                        a.to_bits(),
-                        b.to_bits(),
-                        "window {window} position {pos} element {i}"
-                    );
+                for prompt in [false, true] {
+                    let wrapped = attend(&ring, prompt);
+                    for (i, (&a, &b)) in wrapped.iter().zip(&contiguous).enumerate() {
+                        assert!(b.is_finite());
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "{head_dim} wide heads, window {window}, position {pos}, prompt {prompt}, element {i}"
+                        );
+                    }
                 }
             }
         }

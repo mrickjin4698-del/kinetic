@@ -1,10 +1,11 @@
-// Attention of one query head of one token over the cached positions up to
-// its own, written as a GEMV input. `PAIRS`, head_dim / 64, is set per
-// kernel; lane i holds pairs i + 32k of the head.
+// Attention of one token over its visible cached positions, written as a
+// GEMV input. The query heads of a workgroup share one KV head and run
+// on the same compute unit. Lane i holds pairs i + 32k of each head.
 //
-// The four subgroups take every fourth position, each keeping a running
-// maximum, sum and weighted sum of values (an online softmax), and combine
-// at the end. A token's result does not depend on the rest of its batch.
+// Each query head gets four subgroups that take every fourth position.
+// Each keeps a running maximum, sum and weighted sum of values (an
+// online softmax), and the four combine at the end. A token's result
+// does not depend on the rest of its batch.
 //
 // A token sees the last `window` positions up to its own; position p sits
 // in cache slot p % slots. With gate 1 the output is multiplied by the
@@ -38,22 +39,26 @@ const SUBGROUPS: u32 = 4u;
 const THREADS: u32 = 32u * SUBGROUPS;
 const LOWEST: f32 = -3.4e38;
 
-var<workgroup> top: array<f32, SUBGROUPS>;
-var<workgroup> total: array<f32, SUBGROUPS>;
-var<workgroup> partial: array<f32, SUBGROUPS * HD>;
+var<workgroup> top: array<f32, HEADS * SUBGROUPS>;
+var<workgroup> total: array<f32, HEADS * SUBGROUPS>;
+var<workgroup> partial: array<f32, HEADS * SUBGROUPS * HD>;
 
-@compute @workgroup_size(128)
+@compute @workgroup_size(THREADS * HEADS)
 fn main(
     @builtin(workgroup_id) group: vec3<u32>,
-    @builtin(local_invocation_index) tid: u32,
-    @builtin(subgroup_id) slot: u32,
+    @builtin(local_invocation_index) local: u32,
+    @builtin(subgroup_id) subgroup: u32,
     @builtin(subgroup_invocation_id) lane: u32,
 ) {
     let t = group.y;
     if t >= batch[0] {
         return;
     }
-    let head = group.x;
+    let in_group = subgroup / SUBGROUPS;
+    let part = in_group * SUBGROUPS;
+    let slot = subgroup % SUBGROUPS;
+    let tid = select(local, slot * 32u + lane, HEADS > 1u);
+    let head = group.x * HEADS + in_group;
     let len = batch[1] + t + 1u;
     let start = len - min(len, shape.window);
     let row_words = shape.n_kv * HD / 2u;
@@ -94,30 +99,30 @@ fn main(
         cache_offset = select(cache_offset + word_step, cache_offset - wrap_at, cache_offset >= wrap_at);
     }
     if lane == 0u {
-        top[slot] = m;
-        total[slot] = l;
+        top[part + slot] = m;
+        total[part + slot] = l;
     }
     for (var k = 0u; k < PAIRS; k++) {
-        let e = slot * HD + 2u * (lane + 32u * k);
+        let e = (part + slot) * HD + 2u * (lane + 32u * k);
         partial[e] = acc[k].x;
         partial[e + 1u] = acc[k].y;
     }
     workgroupBarrier();
 
-    var best = top[0];
+    var best = top[part];
     for (var s = 1u; s < SUBGROUPS; s++) {
-        best = max(best, top[s]);
+        best = max(best, top[part + s]);
     }
     var den = 0.0;
     for (var s = 0u; s < SUBGROUPS; s++) {
-        den += total[s] * exp(top[s] - best);
+        den += total[part + s] * exp(top[part + s] - best);
     }
     let out = (t * shape.n_head + head) * HD;
     // HD is a multiple of 64, so subgroups run whole.
     for (var e = tid; e < HD; e += THREADS) {
         var o = 0.0;
         for (var s = 0u; s < SUBGROUPS; s++) {
-            o += partial[s * HD + e] * exp(top[s] - best);
+            o += partial[(part + s) * HD + e] * exp(top[part + s] - best);
         }
         o /= den;
         if shape.gate == 1u {

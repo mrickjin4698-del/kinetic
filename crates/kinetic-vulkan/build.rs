@@ -35,15 +35,24 @@ const KERNELS: &[(&str, &str, &[&str])] = &[
     ),
     ("delta_rule", "", &["delta_qk_scale", "delta_rule"]),
     ("gated_norm", "", &["gated_norm", "put_q8"]),
-    ("attend_64", "const PAIRS: u32 = 1u;", &["attend", "put_q8"]),
+    (
+        "attend_64",
+        "const PAIRS: u32 = 1u; const HEADS: u32 = 1u;",
+        &["attend", "put_q8"],
+    ),
     (
         "attend_128",
-        "const PAIRS: u32 = 2u;",
+        "const PAIRS: u32 = 2u; const HEADS: u32 = 1u;",
         &["attend", "put_q8"],
     ),
     (
         "attend_256",
-        "const PAIRS: u32 = 4u;",
+        "const PAIRS: u32 = 4u; const HEADS: u32 = 1u;",
+        &["attend", "put_q8"],
+    ),
+    (
+        "attend_256_grouped",
+        "const PAIRS: u32 = 4u; const HEADS: u32 = 2u;",
         &["attend", "put_q8"],
     ),
 ];
