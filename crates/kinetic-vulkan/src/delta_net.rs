@@ -46,8 +46,10 @@ impl DeltaShape {
         self.channels() + self.value_dim() + 2 * self.n_v_heads
     }
 
-    fn journal_len(&self) -> usize {
-        self.channels() + 2 * self.n_v_heads
+    /// Four-word alignment lets the recurrence load each lane's query and
+    /// key as a vector, even when the number of value heads is odd.
+    fn journal_stride(&self) -> usize {
+        (self.channels() + 2 * self.n_v_heads).next_multiple_of(4)
     }
 
     fn check(&self) -> Result<()> {
@@ -84,7 +86,7 @@ impl DeltaState {
         Ok(DeltaState {
             state: DeviceBuffer::new(device, state)?,
             ring: ConvRing::new(device, shape.channels(), shape.conv_taps, rows)?,
-            journal: DeviceBuffer::new(device, rows * shape.journal_len())?,
+            journal: DeviceBuffer::new(device, rows * shape.journal_stride())?,
             rows,
         })
     }
@@ -121,7 +123,10 @@ impl DeltaState {
     fn check(&self, shape: &DeltaShape, batch: &Batch) -> Result<()> {
         self.ring.check(batch, shape.channels(), shape.conv_taps)?;
         let state = shape.n_v_heads * shape.head_v_dim * shape.head_k_dim;
-        if self.state.len() == state && self.rows >= batch.rows() {
+        if self.state.len() == state
+            && self.journal.len() == self.rows * shape.journal_stride()
+            && self.rows >= batch.rows()
+        {
             Ok(())
         } else {
             Err(Error::Shape(format!(
@@ -204,6 +209,7 @@ impl Kernels {
                     shape.conv_taps as u32,
                     state.ring.slots() as u32,
                     state.rows as u32,
+                    shape.journal_stride() as u32,
                 ],
                 [(channels + nv).div_ceil(256) as u32, rows as u32, 1],
             );
@@ -282,6 +288,7 @@ impl Kernels {
                     state.rows as u32,
                     shape.eps.to_bits(),
                     replay as u32,
+                    shape.journal_stride() as u32,
                 ],
                 [rows.div_ceil(4) as u32, 1, 1],
             )

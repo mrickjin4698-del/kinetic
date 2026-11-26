@@ -19,6 +19,7 @@ struct Shape {
     journal_slots: u32,
     eps: f32,
     replay: u32,
+    journal_stride: u32,
 }
 
 const DK: u32 = 128u;
@@ -26,13 +27,12 @@ const DK: u32 = 128u;
 var<immediate> shape: Shape;
 
 @group(0) @binding(0) var<storage, read> batch: array<u32>;
-@group(0) @binding(1) var<storage, read> journal: array<f32>;
+@group(0) @binding(1) var<storage, read> journal: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> state: array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read_write> out: array<f32>;
 
-fn head4(base: u32, lane: u32) -> vec4<f32> {
-    let i = base + 4u * lane;
-    return vec4<f32>(journal[i], journal[i + 1u], journal[i + 2u], journal[i + 3u]);
+fn journal_word(base: u32, word: u32) -> f32 {
+    return journal[base + word / 4u][word % 4u];
 }
 
 fn l2_normed(x: vec4<f32>) -> vec4<f32> {
@@ -52,11 +52,15 @@ fn main(
         return;
     }
     let vh = row / dv;
-    let i = row % dv;
     let kh = vh % shape.n_k_heads;
     let key_dim = shape.n_k_heads * DK;
     let value_dim = shape.n_v_heads * dv;
-    let jstride = shape.channels + 2u * shape.n_v_heads;
+    let query_at = kh * (DK / 4u) + lane;
+    let key_at = key_dim / 4u + query_at;
+    let value_at = 2u * key_dim + row;
+    let decay_at = shape.channels + vh;
+    let beta_at = decay_at + shape.n_v_heads;
+    let jstride = shape.journal_stride / 4u;
     let pos0 = batch[1];
     var end = pos0 + batch[0];
     if shape.replay != 0u {
@@ -68,17 +72,17 @@ fn main(
     var s = state[at];
     for (var p = batch[4]; p < end; p++) {
         let base = p % shape.journal_slots * jstride;
-        let k = l2_normed(head4(base + key_dim + kh * DK, lane));
-        let v = journal[base + 2u * key_dim + vh * dv + i];
-        let decay = journal[base + shape.channels + vh];
-        let b = journal[base + shape.channels + shape.n_v_heads + vh];
+        let k = l2_normed(journal[base + key_at]);
+        let v = journal_word(base, value_at);
+        let decay = journal_word(base, decay_at);
+        let b = journal_word(base, beta_at);
         let delta = (v - decay * subgroupAdd(dot(s, k))) * b;
         s = s * decay + k * delta;
         if p >= pos0 {
-            let q = l2_normed(head4(base + kh * DK, lane)) * q_scale;
+            let q = l2_normed(journal[base + query_at]) * q_scale;
             let o = subgroupAdd(dot(s, q));
             if lane == 0u {
-                out[(p - pos0) * value_dim + vh * dv + i] = o;
+                out[(p - pos0) * value_dim + row] = o;
             }
         }
     }

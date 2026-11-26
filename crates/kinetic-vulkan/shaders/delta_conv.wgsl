@@ -17,6 +17,7 @@ struct Shape {
     taps: u32,
     slots: u32,
     journal_slots: u32,
+    journal_stride: u32,
 }
 
 var<immediate> shape: Shape;
@@ -52,8 +53,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index
         return;
     }
     let pos = batch[1] + t;
-    let jstride = shape.channels + 2u * shape.n_v_heads;
-    let slot = pos % shape.journal_slots * jstride;
+    let slot = pos % shape.journal_slots * shape.journal_stride;
     if ch >= shape.channels {
         let h = ch - shape.channels;
         let at = t * shape.stride + shape.channels + shape.value_dim;
