@@ -140,8 +140,6 @@ pub struct VulkanState {
     /// such kernels. Each has buffers of its own: a pass costs a little by
     /// the rows its buffers hold, which would slow every token decoded.
     prompt_passes: Vec<Pass>,
-    /// Brings back the logits of every head row.
-    all_logits: Graph,
     /// What a rollback runs, when a layer needs it.
     replay: Option<Graph>,
     /// Host copies of recurrent layers at earlier lengths, for the warm
@@ -165,7 +163,38 @@ struct Pass {
     work: Work,
     hidden: Graph,
     greedy: Graph,
+    /// Downloads the rows after the first, indexed by head row count minus two.
+    logits_tail: Vec<Option<Graph>>,
     logits: Graph,
+}
+
+impl Pass {
+    fn launch_logits(
+        &mut self,
+        device: &Rc<Device>,
+        vocab: usize,
+        rows: usize,
+    ) -> kinetic_vulkan::Result<()> {
+        if rows == 1 {
+            return self.logits.launch();
+        }
+        let tail = &mut self.logits_tail[rows - 2];
+        let copy = match tail {
+            Some(copy) => copy,
+            None => {
+                let mut commands = Commands::new(device)?;
+                commands.download(
+                    &self.work.logits,
+                    vocab,
+                    &self.work.logits_host,
+                    vocab,
+                    (rows - 1) * vocab,
+                )?;
+                tail.insert(commands.finish()?)
+            }
+        };
+        self.logits.launch_then(copy)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -339,9 +368,6 @@ impl<'m> VulkanModel<'m> {
             .iter()
             .map(|l| l.new_state(dev, self.context, self.prompt_batch))
             .collect::<kinetic_vulkan::Result<Vec<_>>>()?;
-        let vocab = self.n_vocab();
-        let mut all_logits = Commands::new(dev)?;
-        all_logits.download(&work.logits, 0, &work.logits_host, 0, MAX_BATCH * vocab)?;
         let replay = match self.layers.iter().any(VulkanLayer::replays) {
             true => Some(self.record_replay(&work, &layers)?),
             false => None,
@@ -364,7 +390,6 @@ impl<'m> VulkanModel<'m> {
             prompt: false,
             decode: self.record_pass(work, &layers, false)?,
             prompt_passes,
-            all_logits: all_logits.finish()?,
             replay,
             layers,
             marks: Vec::new(),
@@ -404,6 +429,7 @@ impl<'m> VulkanModel<'m> {
             hidden: self.record(&work, states, Head::None, prompt)?,
             greedy: self.record(&work, states, Head::Greedy, prompt)?,
             logits: self.record(&work, states, Head::Logits, prompt)?,
+            logits_tail: (1..work.batch.head_rows()).map(|_| None).collect(),
             work,
         })
     }
@@ -642,13 +668,13 @@ impl<'m> VulkanModel<'m> {
             self.ropes.fill(&mut w.batch, state.pos, n);
             let x = &mut w.embedded.as_mut_slice()[..n * d];
             embed_into(&self.embd, self.embd_scale, chunk, x);
-            let graph = match (head.len(), output) {
-                (0, _) => &pass.hidden,
-                (1, Head::Logits) => &pass.logits,
-                _ => &pass.greedy,
-            };
-            graph.launch()?;
+            match (head.len(), output) {
+                (0, _) => pass.hidden.launch()?,
+                (rows, Head::Logits) => pass.launch_logits(&self.gpu.device, vocab, rows)?,
+                _ => pass.greedy.launch()?,
+            }
 
+            let w = &pass.work;
             if output == Head::Greedy {
                 for pair in w.greedy.as_slice()[..2 * head.len()].chunks_exact(2) {
                     out.greedy.push(pair[0]);
@@ -657,9 +683,6 @@ impl<'m> VulkanModel<'m> {
             }
             out.hidden.extend_from_slice(&w.hidden.as_slice()[..n * d]);
             if output == Head::Logits {
-                if head.len() > 1 {
-                    state.all_logits.launch()?;
-                }
                 let rows = &w.logits_host.as_slice()[..head.len() * vocab];
                 out.logits.extend_from_slice(rows);
             }

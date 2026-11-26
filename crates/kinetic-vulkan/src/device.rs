@@ -127,7 +127,7 @@ impl Device {
 
     /// Ends `cmd`, runs it and waits for it to finish, then frees it.
     pub(crate) fn submit(&self, cmd: vk::CommandBuffer) -> Result<()> {
-        let result = self.end(cmd).and_then(|()| self.execute(cmd));
+        let result = self.end(cmd).and_then(|()| self.execute(&[cmd]));
         self.free(cmd);
         result
     }
@@ -138,16 +138,15 @@ impl Device {
         unsafe { self.raw.end_command_buffer(cmd) }.check("vkEndCommandBuffer")
     }
 
-    /// Runs the ended command buffer `cmd` and waits for it to finish.
-    pub(crate) fn execute(&self, cmd: vk::CommandBuffer) -> Result<()> {
+    /// Runs the ended command buffers and waits for them to finish.
+    pub(crate) fn execute(&self, cmds: &[vk::CommandBuffer]) -> Result<()> {
         // SAFETY: a fence with default flags has no preconditions.
         let fence = unsafe { self.raw.create_fence(&vk::FenceCreateInfo::default(), None) }
             .check("vkCreateFence")?;
-        let cmds = [cmd];
-        let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
-        // SAFETY: the queue is used from this thread only; `cmd` is
-        // executable and `fence` unsignalled. Waiting before destroying the
-        // fence keeps both alive while the queue uses them.
+        let submit = [vk::SubmitInfo::default().command_buffers(cmds)];
+        // SAFETY: the queue is used from this thread only. The distinct
+        // command buffers are executable and the fence is unsignalled.
+        // Waiting keeps them alive while the queue uses them.
         let result = unsafe {
             self.raw
                 .queue_submit(self.queue, &submit, fence)
@@ -167,8 +166,8 @@ impl Device {
         result
     }
 
-    /// Records a barrier after which every earlier write in `cmd`, or in work
-    /// already finished, is visible to later commands and to the host.
+    /// Makes earlier writes in queue submission order visible to later
+    /// commands and to the host.
     ///
     /// # Safety
     ///

@@ -175,6 +175,17 @@ impl Graph {
     pub fn launch(&self) -> Result<()> {
         run(&self.device, &self.ops)
     }
+
+    /// Runs this recording followed by `next` and waits for both.
+    pub fn launch_then(&self, next: &Graph) -> Result<()> {
+        if !Rc::ptr_eq(&self.device, &next.device) || std::ptr::eq(self, next) {
+            return Err(Error::Shape(
+                "expected distinct graphs on the same device".into(),
+            ));
+        }
+        self.launch()?;
+        next.launch()
+    }
 }
 
 /// The encoder commands are being written to. Dispatches and copies need

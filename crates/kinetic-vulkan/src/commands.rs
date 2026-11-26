@@ -282,7 +282,17 @@ impl Graph {
     /// Runs the commands and waits for them; every write is then visible
     /// to the host.
     pub fn launch(&self) -> Result<()> {
-        self.device.execute(self.cmd)
+        self.device.execute(&[self.cmd])
+    }
+
+    /// Runs this recording followed by `next` and waits for both.
+    pub fn launch_then(&self, next: &Graph) -> Result<()> {
+        if !Rc::ptr_eq(&self.device, &next.device) || std::ptr::eq(self, next) {
+            return Err(Error::Shape(
+                "expected distinct graphs on the same device".into(),
+            ));
+        }
+        self.device.execute(&[self.cmd, next.cmd])
     }
 }
 

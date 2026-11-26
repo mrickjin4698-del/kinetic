@@ -73,6 +73,37 @@ fn prompts_give_the_same_bits_however_cut() {
         whole
     );
 
+    // Sampled draft verification asks for all rows on a checkpointed
+    // decode pass. Changing the row count also exercises cached readbacks.
+    let prefix = &ids[..64];
+    let draft = &ids[64..80];
+    gpu.reset(&mut state).unwrap();
+    gpu.set_prompt(&mut state, true);
+    gpu.advance(&mut state, prefix).unwrap();
+    gpu.set_prompt(&mut state, false);
+    let mut expected = Vec::new();
+    for token in draft {
+        expected.extend(
+            gpu.run(&mut state, std::slice::from_ref(token), false)
+                .unwrap()
+                .logits,
+        );
+    }
+    gpu.reset(&mut state).unwrap();
+    gpu.set_prompt(&mut state, true);
+    gpu.advance(&mut state, prefix).unwrap();
+    gpu.set_prompt(&mut state, false);
+    for n in [9, 2, 16, 4, 9] {
+        gpu.checkpoint(&mut state).unwrap();
+        let logits = gpu.run(&mut state, &draft[..n], true).unwrap().logits;
+        assert_eq!(
+            bits(&logits),
+            bits(&expected[..n * gpu.n_vocab()]),
+            "draft rows {n}"
+        );
+        gpu.rollback(&mut state, 0).unwrap();
+    }
+
     // every row, as /logits asks for them
     let n = 80;
     gpu.reset(&mut state).unwrap();
