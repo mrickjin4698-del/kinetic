@@ -16,6 +16,11 @@ pub trait Policy<M: Target> {
         all_rows: bool,
     ) -> (Self::Scores, Vec<f32>);
 
+    /// Scores the last prompt token when the drafter needs only token IDs.
+    fn score_prompt(&self, model: &M, state: &mut M::State, tokens: &[u32]) -> Self::Scores {
+        self.score(model, state, tokens, false).0
+    }
+
     /// Runs a tree of tokens; see [`Target::score_tree`]. `None`, having
     /// run nothing, when the model or the policy cannot.
     fn score_tree(
@@ -78,6 +83,10 @@ impl<M: Target> Policy<M> for Sampler {
             Some(top) => model.top_logits(state, tokens, all_rows, top),
             None => model.logits(state, tokens, all_rows),
         }
+    }
+
+    fn score_prompt(&self, model: &M, state: &mut M::State, tokens: &[u32]) -> Vec<f32> {
+        model.prompt_logits(state, tokens, self.top())
     }
 
     fn score_tree(

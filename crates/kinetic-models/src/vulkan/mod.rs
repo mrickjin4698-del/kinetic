@@ -164,6 +164,8 @@ struct Pass {
     state: Graph,
     hidden: Graph,
     last_logits: Graph,
+    /// The last-logit recording reuses the decoder's work buffers.
+    last_uses_decode: bool,
     greedy: Graph,
     /// Downloads the rows after the first, indexed by head row count minus two.
     logits_tail: Vec<Option<Graph>>,
@@ -374,6 +376,7 @@ impl<'m> VulkanModel<'m> {
             true => Some(self.record_replay(&work, &layers)?),
             false => None,
         };
+        let decode = self.record_pass(work, &layers, None)?;
         // A prompt pass wants the logits of its last token at most.
         let mut sizes = vec![self.prompt_batch];
         if self.prompt_batch > PROMPT_SHORT {
@@ -382,7 +385,7 @@ impl<'m> VulkanModel<'m> {
         let prompt_passes = match self.prompt_batch > MAX_BATCH {
             true => sizes
                 .into_iter()
-                .map(|rows| self.record_pass(new_work(rows, 1)?, &layers, true))
+                .map(|rows| self.record_pass(new_work(rows, 1)?, &layers, Some(&decode.work)))
                 .collect::<kinetic_vulkan::Result<Vec<_>>>()?,
             false => Vec::new(),
         };
@@ -390,7 +393,7 @@ impl<'m> VulkanModel<'m> {
             pos: 0,
             checkpoint: None,
             prompt: false,
-            decode: self.record_pass(work, &layers, false)?,
+            decode,
             prompt_passes,
             replay,
             layers,
@@ -425,19 +428,22 @@ impl<'m> VulkanModel<'m> {
         &self,
         work: Work,
         states: &[LayerState],
-        prompt: bool,
+        decode: Option<&Work>,
     ) -> kinetic_vulkan::Result<Pass> {
+        let prompt = decode.is_some();
         let last = self.layers.len() - 1;
         let defer_queries = prompt && work.batch.rows() > PROMPT_SHORT;
-        let complete_layer = |c: &mut Commands| {
+        let head_decode =
+            decode.filter(|_| defer_queries && matches!(&states[last], LayerState::Attention(_)));
+        let complete_layer = |work: &Work, c: &mut Commands| {
             c.set_prompt(prompt);
             let layer = &self.layers[last];
             if defer_queries {
-                layer.record_queries(&self.gpu, &work, &states[last], c)?;
+                layer.record_queries(&self.gpu, work, &states[last], c)?;
             }
             layer.record_output(
                 &self.gpu,
-                &work,
+                work,
                 &states[last],
                 &self.output_norm,
                 self.eps,
@@ -445,7 +451,7 @@ impl<'m> VulkanModel<'m> {
             )
         };
         let mut hidden = Commands::new(&self.gpu.device)?;
-        complete_layer(&mut hidden)?;
+        complete_layer(&work, &mut hidden)?;
         hidden.download(
             work.h.values(),
             0,
@@ -454,13 +460,30 @@ impl<'m> VulkanModel<'m> {
             work.batch.rows() * self.n_embd,
         )?;
         let mut last_logits = Commands::new(&self.gpu.device)?;
-        complete_layer(&mut last_logits)?;
-        self.record_head(&work, Head::Logits, &mut last_logits)?;
-        last_logits.download(&work.logits, 0, &work.logits_host, 0, self.n_vocab())?;
+        let scored = if let Some(decode) = head_decode {
+            // The state recording has filled the cache for every token.
+            // Continue the final layer on the one row whose logits we read.
+            decode.batch.record_upload(&mut last_logits)?;
+            self.gpu.kernels.copy_head_input(
+                &work.batch,
+                &work.x,
+                &work.h,
+                &decode.x,
+                &decode.h,
+                &mut last_logits,
+            )?;
+            decode
+        } else {
+            &work
+        };
+        complete_layer(scored, &mut last_logits)?;
+        self.record_head(scored, Head::Logits, &mut last_logits)?;
+        last_logits.download(&scored.logits, 0, &work.logits_host, 0, self.n_vocab())?;
         Ok(Pass {
             state: self.record(&work, states, Head::None, prompt, defer_queries)?,
             hidden: hidden.finish()?,
             last_logits: last_logits.finish()?,
+            last_uses_decode: head_decode.is_some(),
             greedy: self.record(&work, states, Head::Greedy, prompt, false)?,
             logits: self.record(&work, states, Head::Logits, prompt, false)?,
             logits_tail: (1..work.batch.head_rows()).map(|_| None).collect(),
@@ -720,7 +743,10 @@ impl<'m> VulkanModel<'m> {
                         .find(|p| p.work.batch.rows() >= n)
                 })
                 .flatten();
-            let pass = pass.unwrap_or(&mut state.decode);
+            let (pass, head_batch) = match pass {
+                Some(pass) => (pass, Some(&mut state.decode.work.batch)),
+                None => (&mut state.decode, None),
+            };
             let w = &mut pass.work;
             w.batch.set(n, state.pos, head.clone(), state.checkpoint)?;
             self.ropes.fill(&mut w.batch, state.pos, n);
@@ -729,7 +755,14 @@ impl<'m> VulkanModel<'m> {
             match (head.len(), output, read_hidden) {
                 (0, _, false) => pass.state.launch()?,
                 (0, _, true) => pass.state.launch_then(&pass.hidden)?,
-                (1, Head::Logits, false) => pass.state.launch_then(&pass.last_logits)?,
+                (1, Head::Logits, false) => {
+                    if let Some(batch) = head_batch.filter(|_| pass.last_uses_decode) {
+                        let pos = state.pos + head.start;
+                        batch.set(1, pos, 0..1, None)?;
+                        self.ropes.fill(batch, pos, 1);
+                    }
+                    pass.state.launch_then(&pass.last_logits)?;
+                }
                 (rows, Head::Logits, _) => pass.launch_logits(&self.gpu.device, vocab, rows)?,
                 _ => pass.greedy.launch()?,
             }

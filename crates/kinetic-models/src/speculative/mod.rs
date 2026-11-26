@@ -63,6 +63,11 @@ pub trait Drafter<M: Target> {
         true
     }
 
+    /// Whether the final chunk scored during prefill needs its hidden states.
+    fn observes_last_prompt_hidden(&self) -> bool {
+        true
+    }
+
     /// Called with every token the model keeps, in order, and the hidden
     /// states the model returns for each, an equal number per token: the
     /// normalized final state first, then any [`crate::Model::set_taps`]
@@ -87,6 +92,10 @@ pub trait Drafter<M: Target> {
 impl<M: Target, D: Drafter<M> + ?Sized> Drafter<M> for Box<D> {
     fn observes_prompt_hidden(&self) -> bool {
         (**self).observes_prompt_hidden()
+    }
+
+    fn observes_last_prompt_hidden(&self) -> bool {
+        (**self).observes_last_prompt_hidden()
     }
 
     fn observe(&mut self, model: &M, tokens: &[u32], hidden: &[f32]) {
@@ -200,7 +209,11 @@ impl<D> Decoder<D> {
     {
         let tokens = &context[start..];
         model.set_prompt(state, true);
-        let (scores, hidden) = policy.score(model, state, tokens, false);
+        let (scores, hidden) = if self.drafter.observes_last_prompt_hidden() {
+            policy.score(model, state, tokens, false)
+        } else {
+            (policy.score_prompt(model, state, tokens), Vec::new())
+        };
         model.set_prompt(state, false);
         self.drafter.observe(model, tokens, &hidden);
         self.next = Some(policy.choose(model, &scores, 0, context));

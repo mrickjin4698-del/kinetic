@@ -243,6 +243,54 @@ fn seeded_sampling_is_plain_sampling() {
 }
 
 #[test]
+fn last_prompt_hidden_follows_the_drafter_request() {
+    struct Observer {
+        need_last: bool,
+        lengths: Vec<usize>,
+    }
+
+    impl Drafter<Toy> for Observer {
+        fn observes_prompt_hidden(&self) -> bool {
+            false
+        }
+
+        fn observes_last_prompt_hidden(&self) -> bool {
+            self.need_last
+        }
+
+        fn observe(&mut self, _model: &Toy, _tokens: &[u32], hidden: &[f32]) {
+            self.lengths.push(hidden.len());
+        }
+
+        fn propose(&mut self, _model: &Toy, _context: &[u32], _limit: usize) -> Vec<u32> {
+            Vec::new()
+        }
+    }
+
+    let expected = plain(&mut Sampler::new(sampling(17)))[0];
+    let split = 4;
+    for need_last in [false, true] {
+        let mut decoder = Decoder::new(Observer {
+            need_last,
+            lengths: Vec::new(),
+        });
+        let mut state = ToyState::default();
+        decoder.feed(&Toy, &mut state, &PROMPT[..split]);
+        decoder.prefill(
+            &Toy,
+            &mut Sampler::new(sampling(17)),
+            &mut state,
+            &PROMPT,
+            split,
+        );
+        let final_len = if need_last { PROMPT.len() - split } else { 0 };
+        assert_eq!(decoder.drafter.lengths, [0, final_len]);
+        assert_eq!(state.tokens, PROMPT);
+        assert_eq!(decoder.pending(), Some(expected));
+    }
+}
+
+#[test]
 fn ensemble_scores_follow_the_hits() {
     let ensemble = Ensemble::new(vec![
         Box::new(Zeros) as Box<dyn Drafter<Toy>>,

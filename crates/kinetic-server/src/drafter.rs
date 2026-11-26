@@ -19,6 +19,10 @@ impl<M: Predictor> Drafter<M> for Source<M> {
         matches!(self, Self::Mtp(_))
     }
 
+    fn observes_last_prompt_hidden(&self) -> bool {
+        self.observes_prompt_hidden()
+    }
+
     fn observe(&mut self, model: &M, tokens: &[u32], hidden: &[f32]) {
         match self {
             Source::Lookup(d) => Drafter::<M>::observe(d, model, tokens, hidden),

@@ -23,6 +23,7 @@ const KERNELS: &[(&str, &str, &[&str])] = &[
     ("quantize_q8", "", &["quantize_q8"]),
     ("read_sum", "", &["read_sum"]),
     ("norm", "", &["norm", "put_q8"]),
+    ("head_input", "", &["head_input"]),
     ("swiglu", "", &["swiglu", "put_q8"]),
     ("argmax", "", &["argmax"]),
     ("rope", "", &["rope"]),

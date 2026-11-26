@@ -63,6 +63,18 @@ impl Target for VulkanModel<'_> {
         (f.logits, f.hidden)
     }
 
+    fn prompt_logits(
+        &self,
+        state: &mut VulkanState,
+        tokens: &[u32],
+        top: Option<usize>,
+    ) -> Vec<f32> {
+        if top == Some(1) {
+            return device(self.run_top1(state, tokens, false)).logits;
+        }
+        device(self.last_logits(state, tokens))
+    }
+
     fn greedy(&self, scores: &Vec<u32>, row: usize) -> u32 {
         scores[row]
     }

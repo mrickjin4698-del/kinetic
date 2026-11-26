@@ -29,6 +29,8 @@ const MANY_ROWS_PER_GROUP: usize = 8;
 const Q8_BLOCK: usize = 32;
 /// Invocations per workgroup of quantize_q8.wgsl, one per block of 32.
 const QUANTIZE_THREADS: usize = 64;
+/// Invocations per workgroup of head_input.wgsl.
+const HEAD_INPUT_THREADS: usize = 128;
 
 /// Elements per kernel block for each type with a GEMV kernel.
 fn block_len(ty: TensorType) -> Option<usize> {
@@ -227,6 +229,67 @@ pub struct Out {
 }
 
 impl Kernels {
+    /// Copies a batch's single head row to row zero of smaller buffers.
+    /// Both the residual and the three normalized input planes keep their bits.
+    pub fn copy_head_input(
+        &self,
+        batch: &Batch,
+        residual: &DeviceBuffer<f32>,
+        input: &GemvInput,
+        out_residual: &DeviceBuffer<f32>,
+        out: &GemvInput,
+        commands: &mut Commands,
+    ) -> Result<()> {
+        let width = input.width();
+        let fits = width != 0
+            && out.width() == width
+            && input.rows() >= batch.rows()
+            && residual.len() / width >= batch.rows()
+            && out.rows() != 0
+            && out_residual.len() >= width
+            && width.div_ceil(HEAD_INPUT_THREADS) <= MAX_GROUPS as usize;
+        let [x, qs, ds] = input.outputs();
+        let [ox, oqs, ods] = out.outputs();
+        let src = [residual.allocation(), x, qs, ds];
+        let dst = [out_residual.allocation(), ox, oqs, ods];
+        let distinct = dst
+            .iter()
+            .enumerate()
+            .all(|(i, &a)| !src.iter().chain(&dst[..i]).any(|&b| Rc::ptr_eq(a, b)));
+        if !fits || !distinct {
+            return Err(Error::Shape(format!(
+                "head input of {width} elements and {} rows",
+                batch.rows()
+            )));
+        }
+        commands.independent(|commands| {
+            for (i, [first, second]) in [[width, width], [width / 4, width / Q8_BLOCK * 2]]
+                .into_iter()
+                .enumerate()
+            {
+                let at = i * 2;
+                // SAFETY: the batch selects a row within its checked capacity.
+                // Each dispatch copies two planes into distinct destination
+                // buffers, with lengths in four-byte words.
+                unsafe {
+                    commands.dispatch(
+                        &self.head_input,
+                        &[
+                            batch.device().allocation(),
+                            src[at],
+                            src[at + 1],
+                            dst[at],
+                            dst[at + 1],
+                        ],
+                        &[first as u32, second as u32],
+                        [first.max(second).div_ceil(HEAD_INPUT_THREADS) as u32, 1, 1],
+                    )
+                };
+            }
+            Ok(())
+        })
+    }
+
     /// Records `y = w x` in `commands`.
     pub fn gemv(
         &self,

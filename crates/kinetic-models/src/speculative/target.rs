@@ -55,6 +55,20 @@ pub trait Target {
         self.logits(state, tokens, all_rows)
     }
 
+    /// Scores the last prompt token when hidden states are not needed.
+    /// With `top`, the same highest logits as [`Target::top_logits`] suffice.
+    fn prompt_logits(
+        &self,
+        state: &mut Self::State,
+        tokens: &[u32],
+        top: Option<usize>,
+    ) -> Vec<f32> {
+        match top {
+            Some(top) => self.top_logits(state, tokens, false, top).0,
+            None => self.logits(state, tokens, false).0,
+        }
+    }
+
     /// Runs a tree of tokens in one pass after [`Target::checkpoint`]:
     /// token `i` follows token `parents[i]`, an earlier one, or the tokens
     /// already run when `None`. Returns what [`Target::score`] returns for
