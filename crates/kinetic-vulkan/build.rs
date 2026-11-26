@@ -52,42 +52,52 @@ const KERNELS: &[(&str, &str, &[&str])] = &[
     (
         "attend_64",
         "const PAIRS: u32 = 1u; const HEADS: u32 = 1u;",
-        &["attend_planar", "attend", "put_q8"],
+        &["attend_planar", "attend_shared", "attend", "put_q8"],
     ),
     (
         "attend_128",
         "const PAIRS: u32 = 2u; const HEADS: u32 = 1u;",
-        &["attend_planar", "attend", "put_q8"],
+        &["attend_planar", "attend_shared", "attend", "put_q8"],
     ),
     (
         "attend_256",
         "const PAIRS: u32 = 4u; const HEADS: u32 = 1u;",
-        &["attend_planar", "attend", "put_q8"],
+        &["attend_planar", "attend_shared", "attend", "put_q8"],
     ),
     (
         "attend_256_grouped",
         "const PAIRS: u32 = 4u; const HEADS: u32 = 2u;",
-        &["attend_planar", "attend", "put_q8"],
+        &["attend_planar", "attend_shared", "attend", "put_q8"],
     ),
     (
         "attend_64_packed",
         "const PAIRS: u32 = 1u; const HEADS: u32 = 1u;",
-        &["attend_packed", "attend", "put_q8"],
+        &["attend_packed", "attend_shared", "attend", "put_q8"],
     ),
     (
         "attend_128_packed",
         "const PAIRS: u32 = 2u; const HEADS: u32 = 1u;",
-        &["attend_packed", "attend", "put_q8"],
+        &["attend_packed", "attend_shared", "attend", "put_q8"],
     ),
     (
         "attend_256_packed",
         "const PAIRS: u32 = 4u; const HEADS: u32 = 1u;",
-        &["attend_packed", "attend", "put_q8"],
+        &["attend_packed", "attend_shared", "attend", "put_q8"],
     ),
     (
         "attend_256_packed_grouped",
         "const PAIRS: u32 = 4u; const HEADS: u32 = 2u;",
-        &["attend_packed", "attend", "put_q8"],
+        &["attend_packed", "attend_shared", "attend", "put_q8"],
+    ),
+    (
+        "attend_256_paired_tokens",
+        "const PAIRS: u32 = 4u; const HEADS: u32 = 1u;",
+        &[
+            "attend_packed",
+            "attend_shared",
+            "attend_paired_tokens",
+            "put_q8",
+        ],
     ),
 ];
 

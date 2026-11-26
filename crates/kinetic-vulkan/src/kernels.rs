@@ -72,6 +72,7 @@ pub struct Kernels {
     pub(crate) attend_256_grouped: Option<Rc<Kernel>>,
     pub(crate) attend_packed: Option<[Rc<Kernel>; 3]>,
     pub(crate) attend_256_packed_grouped: Option<Rc<Kernel>>,
+    pub(crate) attend_256_paired_tokens: Option<Rc<Kernel>>,
     read_sum: Rc<Kernel>,
     /// The batch words of a pass of one token, for GEMVs outside a model.
     pub(crate) single: DeviceBuffer<u32>,
@@ -237,6 +238,14 @@ impl Kernels {
                     attend(
                         "attend_256_packed_grouped",
                         spirv!("attend_256_packed_grouped"),
+                    )
+                })
+                .transpose()?,
+            attend_256_paired_tokens: matrix
+                .then(|| {
+                    attend(
+                        "attend_256_paired_tokens",
+                        spirv!("attend_256_paired_tokens"),
                     )
                 })
                 .transpose()?,

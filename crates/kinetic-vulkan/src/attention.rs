@@ -387,12 +387,23 @@ impl Kernels {
                 self.attend_256_grouped.as_ref()
             };
             // Pair consecutive query heads within each KV head.
-            let pair_heads = hd == 256
-                && commands.prompt()
-                && (shape.n_head / shape.n_head_kv).is_multiple_of(2);
-            let (attend, heads) = grouped
-                .filter(|_| pair_heads)
-                .map_or((single, 1), |k| (k, 2));
+            let wide_prompt = hd == 256 && commands.prompt();
+            let pair_heads = wide_prompt && (shape.n_head / shape.n_head_kv).is_multiple_of(2);
+            let pair_tokens = packed
+                && wide_prompt
+                && rows > 64
+                && shape.window.is_none()
+                && cache.slots >= batch.positions();
+            let (attend, heads, tokens) = match self
+                .attend_256_paired_tokens
+                .as_ref()
+                .filter(|_| pair_tokens)
+            {
+                Some(k) => (k, 1, 2),
+                None => grouped
+                    .filter(|_| pair_heads)
+                    .map_or((single, 1, 1), |k| (k, 2, 1)),
+            };
             let [ox, oq, od] = out.outputs();
             // SAFETY: matches attend.wgsl. The batch reads from the checked
             // cache and writes each head into its checked output row.
@@ -419,7 +430,11 @@ impl Kernels {
                         shape.window.map_or(u32::MAX, |w| w as u32),
                         cache.slots as u32,
                     ],
-                    [(shape.n_head / heads) as u32, rows as u32, 1],
+                    [
+                        (shape.n_head / heads) as u32,
+                        rows.div_ceil(tokens) as u32,
+                        1,
+                    ],
                 )
             };
         }
