@@ -31,6 +31,10 @@ impl Target for VulkanModel<'_> {
         device(self.run_greedy(state, tokens, all_rows))
     }
 
+    fn advance(&self, state: &mut VulkanState, tokens: &[u32]) -> Vec<f32> {
+        device(VulkanModel::advance(self, state, tokens))
+    }
+
     fn logits(
         &self,
         state: &mut VulkanState,

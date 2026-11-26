@@ -58,6 +58,21 @@ fn prompts_give_the_same_bits_however_cut() {
         assert_eq!(run_cut(&gpu, &mut state, &ids, cut), whole, "cut {cut}");
     }
 
+    // The hidden-only prefix still feeds the drafter and the next scored pass.
+    let cut = 513;
+    gpu.reset(&mut state).unwrap();
+    gpu.set_prompt(&mut state, true);
+    let scored = gpu.run(&mut state, &ids[..cut], false).unwrap().hidden;
+    gpu.reset(&mut state).unwrap();
+    gpu.set_prompt(&mut state, true);
+    let advanced = gpu.advance(&mut state, &ids[..cut]).unwrap();
+    assert_eq!(bits(&advanced), bits(&scored));
+    assert_eq!(state.len(), cut);
+    assert_eq!(
+        bits(&gpu.run(&mut state, &ids[cut..], false).unwrap().logits),
+        whole
+    );
+
     // every row, as /logits asks for them
     let n = 80;
     gpu.reset(&mut state).unwrap();

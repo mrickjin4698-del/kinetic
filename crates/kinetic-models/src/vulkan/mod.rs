@@ -133,17 +133,13 @@ pub struct VulkanState {
     /// Whether the tokens being run are a prompt's; see
     /// [`VulkanModel::set_prompt`].
     prompt: bool,
-    work: Work,
+    decode: Pass,
     layers: Vec<LayerState>,
-    /// The recorded pass, and the same with the logits of one head row
-    /// brought back.
-    step: Graph,
-    step_logits: Graph,
     /// Prompt passes, which the device may run with kernels written for
     /// many tokens at once, by rows, fewest first; none where it has no
     /// such kernels. Each has buffers of its own: a pass costs a little by
     /// the rows its buffers hold, which would slow every token decoded.
-    prompt_passes: Vec<PromptPass>,
+    prompt_passes: Vec<Pass>,
     /// Brings back the logits of every head row.
     all_logits: Graph,
     /// What a rollback runs, when a layer needs it.
@@ -164,12 +160,19 @@ impl VulkanState {
     }
 }
 
-/// A prompt pass of some number of rows: its buffers, and its recorded
-/// pass without and with the logits of its last token brought back.
-struct PromptPass {
+/// A pass's buffers and recordings for its possible outputs.
+struct Pass {
     work: Work,
-    step: Graph,
-    step_logits: Graph,
+    hidden: Graph,
+    greedy: Graph,
+    logits: Graph,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Head {
+    None,
+    Greedy,
+    Logits,
 }
 
 /// What a run produces besides the state it advances.
@@ -346,14 +349,7 @@ impl<'m> VulkanModel<'m> {
         let prompt_passes = match self.prompt_batch > MAX_BATCH {
             true => sizes
                 .into_iter()
-                .map(|rows| {
-                    let work = new_work(rows, 1)?;
-                    Ok(PromptPass {
-                        step: self.record(&work, &layers, false, true)?,
-                        step_logits: self.record(&work, &layers, true, true)?,
-                        work,
-                    })
-                })
+                .map(|rows| self.record_pass(new_work(rows, 1)?, &layers, true))
                 .collect::<kinetic_vulkan::Result<Vec<_>>>()?,
             false => Vec::new(),
         };
@@ -361,12 +357,10 @@ impl<'m> VulkanModel<'m> {
             pos: 0,
             checkpoint: None,
             prompt: false,
-            step: self.record(&work, &layers, false, false)?,
-            step_logits: self.record(&work, &layers, true, false)?,
+            decode: self.record_pass(work, &layers, false)?,
             prompt_passes,
             all_logits: all_logits.finish()?,
             replay,
-            work,
             layers,
             marks: Vec::new(),
         })
@@ -392,17 +386,29 @@ impl<'m> VulkanModel<'m> {
             .iter()
             .map(|p| p.work.size_bytes())
             .sum();
-        state.work.size_bytes() + prompt + layers
+        state.decode.work.size_bytes() + prompt + layers
     }
 
-    /// Records one pass: the batch and embeddings in, every layer, the
-    /// head and its greedy tokens, and the results out, with `logits` the
-    /// logits of the first head row too.
+    fn record_pass(
+        &self,
+        work: Work,
+        states: &[LayerState],
+        prompt: bool,
+    ) -> kinetic_vulkan::Result<Pass> {
+        Ok(Pass {
+            hidden: self.record(&work, states, Head::None, prompt)?,
+            greedy: self.record(&work, states, Head::Greedy, prompt)?,
+            logits: self.record(&work, states, Head::Logits, prompt)?,
+            work,
+        })
+    }
+
+    /// Records the layers, the selected head output and the readback.
     fn record(
         &self,
         w: &Work,
         states: &[LayerState],
-        logits: bool,
+        head: Head,
         prompt: bool,
     ) -> kinetic_vulkan::Result<Graph> {
         let (k, d) = (&self.gpu.kernels, self.n_embd);
@@ -423,25 +429,32 @@ impl<'m> VulkanModel<'m> {
             layer.record(&self.gpu, w, state, next, self.eps, &mut c)?;
         }
         let vocab = self.n_vocab();
-        let out = Out {
-            stride: vocab,
-            offset: 0,
-        };
-        k.gemv_rows(
-            &self.output,
-            &w.h,
-            &w.logits,
-            out,
-            Rows::Head,
-            &w.batch,
-            &mut c,
-        )?;
-        k.argmax(&w.batch, &w.logits, vocab, &w.best, &mut c)?;
-        c.download(w.h.values(), 0, &w.hidden, 0, rows * d)?;
-        c.download(&w.best, 0, &w.greedy, 0, w.greedy.len())?;
-        if logits {
-            c.download(&w.logits, 0, &w.logits_host, 0, vocab)?;
+        if head != Head::None {
+            let out = Out {
+                stride: vocab,
+                offset: 0,
+            };
+            k.gemv_rows(
+                &self.output,
+                &w.h,
+                &w.logits,
+                out,
+                Rows::Head,
+                &w.batch,
+                &mut c,
+            )?;
         }
+        if head == Head::Greedy {
+            k.argmax(&w.batch, &w.logits, vocab, &w.best, &mut c)?;
+        }
+        c.independent(|c| {
+            c.download(w.h.values(), 0, &w.hidden, 0, rows * d)?;
+            match head {
+                Head::None => Ok(()),
+                Head::Greedy => c.download(&w.best, 0, &w.greedy, 0, w.greedy.len()),
+                Head::Logits => c.download(&w.logits, 0, &w.logits_host, 0, vocab),
+            }
+        })?;
         c.finish()
     }
 
@@ -465,7 +478,7 @@ impl<'m> VulkanModel<'m> {
         tokens: &[u32],
         all_logits: bool,
     ) -> kinetic_vulkan::Result<Forward> {
-        let out = self.forward(state, tokens, all_logits, true)?;
+        let out = self.forward(state, tokens, all_logits, Head::Logits)?;
         Ok(Forward {
             logits: out.logits,
             hidden: out.hidden,
@@ -481,7 +494,7 @@ impl<'m> VulkanModel<'m> {
         tokens: &[u32],
         all_rows: bool,
     ) -> kinetic_vulkan::Result<(Vec<u32>, Vec<f32>)> {
-        let out = self.forward(state, tokens, all_rows, false)?;
+        let out = self.forward(state, tokens, all_rows, Head::Greedy)?;
         Ok((out.greedy, out.hidden))
     }
 
@@ -495,7 +508,7 @@ impl<'m> VulkanModel<'m> {
         tokens: &[u32],
         all_rows: bool,
     ) -> kinetic_vulkan::Result<Forward> {
-        let out = self.forward(state, tokens, all_rows, false)?;
+        let out = self.forward(state, tokens, all_rows, Head::Greedy)?;
         let vocab = self.n_vocab();
         let mut logits = vec![f32::NEG_INFINITY; out.greedy.len() * vocab];
         for (row, (&t, &v)) in out.greedy.iter().zip(&out.top).enumerate() {
@@ -505,6 +518,15 @@ impl<'m> VulkanModel<'m> {
             logits,
             hidden: out.hidden,
         })
+    }
+
+    /// Advances the sequence and returns the normalized hidden state of every token.
+    pub fn advance(
+        &self,
+        state: &mut VulkanState,
+        tokens: &[u32],
+    ) -> kinetic_vulkan::Result<Vec<f32>> {
+        Ok(self.forward(state, tokens, false, Head::None)?.hidden)
     }
 
     /// Marks the current length so a later [`VulkanModel::rollback`] can
@@ -530,7 +552,7 @@ impl<'m> VulkanModel<'m> {
             "cannot keep more tokens than were run"
         );
         if let Some(replay) = state.replay.as_ref().filter(|_| keep > 0) {
-            state.work.batch.set_replay(start, start + keep)?;
+            state.decode.work.batch.set_replay(start, start + keep)?;
             replay.launch()?;
         }
         state.pos = start + keep;
@@ -563,7 +585,7 @@ impl<'m> VulkanModel<'m> {
         state: &mut VulkanState,
         tokens: &[u32],
         all_rows: bool,
-        logits: bool,
+        output: Head,
     ) -> kinetic_vulkan::Result<Output> {
         self.check(state, tokens)?;
         let (d, vocab) = (self.n_embd, self.n_vocab());
@@ -573,7 +595,6 @@ impl<'m> VulkanModel<'m> {
             hidden: Vec::with_capacity(tokens.len() * d),
             logits: Vec::new(),
         };
-        let mut done = 0;
         let mut rest = tokens;
         while !rest.is_empty() {
             // Tokens whose rows are not each wanted, and that no draft may
@@ -596,10 +617,10 @@ impl<'m> VulkanModel<'m> {
             });
             let chunk;
             (chunk, rest) = rest.split_at(n);
-            let head: Range<usize> = match (all_rows, done + n == tokens.len()) {
-                (true, _) => 0..n,
-                (false, true) => n - 1..n,
-                (false, false) => n..n,
+            let head: Range<usize> = match (output, all_rows, rest.is_empty()) {
+                (Head::None, _, _) | (_, false, false) => n..n,
+                (_, true, _) => 0..n,
+                (_, false, true) => n - 1..n,
             };
             // the smallest prompt pass that holds them
             let pass = prompt
@@ -610,33 +631,34 @@ impl<'m> VulkanModel<'m> {
                         .find(|p| p.work.batch.rows() >= n)
                 })
                 .flatten();
-            let (w, step, step_logits) = match pass {
-                Some(p) => (&mut p.work, &p.step, &p.step_logits),
-                None => (&mut state.work, &state.step, &state.step_logits),
-            };
+            let pass = pass.unwrap_or(&mut state.decode);
+            let w = &mut pass.work;
             w.batch.set(n, state.pos, head.clone(), state.checkpoint)?;
             self.ropes.fill(&mut w.batch, state.pos, n);
             let x = &mut w.embedded.as_mut_slice()[..n * d];
             embed_into(&self.embd, self.embd_scale, chunk, x);
-            let one = logits && head.len() == 1;
-            match one {
-                true => step_logits.launch()?,
-                false => step.launch()?,
-            }
-            for pair in w.greedy.as_slice()[..2 * head.len()].chunks_exact(2) {
-                out.greedy.push(pair[0]);
-                out.top.push(f32::from_bits(pair[1]));
+            let graph = match (head.len(), output) {
+                (0, _) => &pass.hidden,
+                (1, Head::Logits) => &pass.logits,
+                _ => &pass.greedy,
+            };
+            graph.launch()?;
+
+            if output == Head::Greedy {
+                for pair in w.greedy.as_slice()[..2 * head.len()].chunks_exact(2) {
+                    out.greedy.push(pair[0]);
+                    out.top.push(f32::from_bits(pair[1]));
+                }
             }
             out.hidden.extend_from_slice(&w.hidden.as_slice()[..n * d]);
-            if logits && head.len() > 1 {
-                state.all_logits.launch()?;
-            }
-            if logits {
+            if output == Head::Logits {
+                if head.len() > 1 {
+                    state.all_logits.launch()?;
+                }
                 let rows = &w.logits_host.as_slice()[..head.len() * vocab];
                 out.logits.extend_from_slice(rows);
             }
             state.pos += n;
-            done += n;
         }
         Ok(out)
     }

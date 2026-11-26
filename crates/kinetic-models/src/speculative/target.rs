@@ -23,6 +23,11 @@ pub trait Target {
         all_rows: bool,
     ) -> (Self::Scores, Vec<f32>);
 
+    /// Advances `state` and returns the normalized hidden state of each token.
+    fn advance(&self, state: &mut Self::State, tokens: &[u32]) -> Vec<f32> {
+        self.score(state, tokens, false).1
+    }
+
     /// Runs `tokens` like [`Target::score`] but returns the logits of each
     /// row, [`Target::n_vocab`] values apiece.
     fn logits(

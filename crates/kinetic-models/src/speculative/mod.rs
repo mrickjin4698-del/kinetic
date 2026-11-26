@@ -166,7 +166,7 @@ impl<D> Decoder<D> {
         D: Drafter<M>,
     {
         model.set_prompt(state, true);
-        let (_, hidden) = model.score(state, tokens, false);
+        let hidden = model.advance(state, tokens);
         model.set_prompt(state, false);
         self.drafter.observe(model, tokens, &hidden);
         self.next = None;
