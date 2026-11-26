@@ -58,6 +58,11 @@ pub use target::Target;
 
 /// A source of draft tokens for target model `M`.
 pub trait Drafter<M: Target> {
+    /// False lets leading prompt chunks call observe with an empty hidden slice.
+    fn observes_prompt_hidden(&self) -> bool {
+        true
+    }
+
     /// Called with every token the model keeps, in order, and the hidden
     /// states the model returns for each, an equal number per token: the
     /// normalized final state first, then any [`crate::Model::set_taps`]
@@ -80,6 +85,10 @@ pub trait Drafter<M: Target> {
 }
 
 impl<M: Target, D: Drafter<M> + ?Sized> Drafter<M> for Box<D> {
+    fn observes_prompt_hidden(&self) -> bool {
+        (**self).observes_prompt_hidden()
+    }
+
     fn observe(&mut self, model: &M, tokens: &[u32], hidden: &[f32]) {
         (**self).observe(model, tokens, hidden);
     }
@@ -166,7 +175,12 @@ impl<D> Decoder<D> {
         D: Drafter<M>,
     {
         model.set_prompt(state, true);
-        let hidden = model.advance(state, tokens);
+        let hidden = if self.drafter.observes_prompt_hidden() {
+            model.advance(state, tokens)
+        } else {
+            model.advance_state(state, tokens);
+            Vec::new()
+        };
         model.set_prompt(state, false);
         self.drafter.observe(model, tokens, &hidden);
         self.next = None;

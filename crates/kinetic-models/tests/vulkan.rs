@@ -7,8 +7,11 @@
 
 #![cfg(feature = "vulkan")]
 
+use std::cell::Cell;
+
 use kinetic_gguf::GgufFile;
-use kinetic_models::vulkan::{VulkanModel, VulkanState};
+use kinetic_models::vulkan::{VulkanModel, VulkanRunner, VulkanState};
+use kinetic_models::warm::Runner;
 
 /// Longer than a prompt pass of 512 tokens, to cut across one.
 const LEN: usize = 600;
@@ -72,6 +75,21 @@ fn prompts_give_the_same_bits_however_cut() {
         bits(&gpu.run(&mut state, &ids[cut..], false).unwrap().logits),
         whole
     );
+
+    let runner = VulkanRunner {
+        gpu: &gpu,
+        model: &model,
+        spare: Cell::new(None),
+    };
+    gpu.reset(&mut state).unwrap();
+    gpu.set_prompt(&mut state, true);
+    gpu.advance_state(&mut state, &ids[..cut]).unwrap();
+    assert_eq!(state.len(), cut);
+    assert_eq!(bits(&runner.forward(&mut state, &ids[cut..])), whole);
+
+    gpu.reset(&mut state).unwrap();
+    assert_eq!(bits(&runner.forward(&mut state, &ids)), whole);
+    assert_eq!(state.len(), ids.len());
 
     // Sampled draft verification asks for all rows on a checkpointed
     // decode pass. Changing the row count also exercises cached readbacks.

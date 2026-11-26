@@ -142,6 +142,7 @@ impl<'a> VulkanBackend<'a> {
     /// Turns RAD-1 off: every token costs one forward pass.
     pub fn without_drafts(mut self) -> Self {
         self.decoder.max_draft = 0;
+        self.decoder.drafter = Ensemble::new(Vec::new());
         VulkanBackend {
             cpu: self.cpu.without_drafts(),
             ..self

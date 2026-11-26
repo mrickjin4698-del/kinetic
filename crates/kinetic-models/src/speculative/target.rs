@@ -28,6 +28,11 @@ pub trait Target {
         self.score(state, tokens, false).1
     }
 
+    /// Runs tokens when only the updated sequence state is needed.
+    fn advance_state(&self, state: &mut Self::State, tokens: &[u32]) {
+        drop(self.advance(state, tokens));
+    }
+
     /// Runs `tokens` like [`Target::score`] but returns the logits of each
     /// row, [`Target::n_vocab`] values apiece.
     fn logits(

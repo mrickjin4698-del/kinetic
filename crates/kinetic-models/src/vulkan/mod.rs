@@ -161,7 +161,9 @@ impl VulkanState {
 /// A pass's buffers and recordings for its possible outputs.
 struct Pass {
     work: Work,
+    state: Graph,
     hidden: Graph,
+    last_logits: Graph,
     greedy: Graph,
     /// Downloads the rows after the first, indexed by head row count minus two.
     logits_tail: Vec<Option<Graph>>,
@@ -425,8 +427,21 @@ impl<'m> VulkanModel<'m> {
         states: &[LayerState],
         prompt: bool,
     ) -> kinetic_vulkan::Result<Pass> {
+        let mut hidden = Commands::new(&self.gpu.device)?;
+        hidden.download(
+            work.h.values(),
+            0,
+            &work.hidden,
+            0,
+            work.batch.rows() * self.n_embd,
+        )?;
+        let mut last_logits = Commands::new(&self.gpu.device)?;
+        self.record_head(&work, Head::Logits, &mut last_logits)?;
+        last_logits.download(&work.logits, 0, &work.logits_host, 0, self.n_vocab())?;
         Ok(Pass {
-            hidden: self.record(&work, states, Head::None, prompt)?,
+            state: self.record(&work, states, Head::None, prompt)?,
+            hidden: hidden.finish()?,
+            last_logits: last_logits.finish()?,
             greedy: self.record(&work, states, Head::Greedy, prompt)?,
             logits: self.record(&work, states, Head::Logits, prompt)?,
             logits_tail: (1..work.batch.head_rows()).map(|_| None).collect(),
@@ -459,25 +474,11 @@ impl<'m> VulkanModel<'m> {
                 .map_or(&self.output_norm, |l| &l.mixer_norm);
             layer.record(&self.gpu, w, state, next, self.eps, &mut c)?;
         }
+        if head == Head::None {
+            return c.finish();
+        }
+        self.record_head(w, head, &mut c)?;
         let vocab = self.n_vocab();
-        if head != Head::None {
-            let out = Out {
-                stride: vocab,
-                offset: 0,
-            };
-            k.gemv_rows(
-                &self.output,
-                &w.h,
-                &w.logits,
-                out,
-                Rows::Head,
-                &w.batch,
-                &mut c,
-            )?;
-        }
-        if head == Head::Greedy {
-            k.argmax(&w.batch, &w.logits, vocab, &w.best, &mut c)?;
-        }
         c.independent(|c| {
             c.download(w.h.values(), 0, &w.hidden, 0, rows * d)?;
             match head {
@@ -487,6 +488,20 @@ impl<'m> VulkanModel<'m> {
             }
         })?;
         c.finish()
+    }
+
+    fn record_head(&self, w: &Work, head: Head, c: &mut Commands) -> kinetic_vulkan::Result<()> {
+        let k = &self.gpu.kernels;
+        let vocab = self.n_vocab();
+        let out = Out {
+            stride: vocab,
+            offset: 0,
+        };
+        k.gemv_rows(&self.output, &w.h, &w.logits, out, Rows::Head, &w.batch, c)?;
+        if head == Head::Greedy {
+            k.argmax(&w.batch, &w.logits, vocab, &w.best, c)?;
+        }
+        Ok(())
     }
 
     /// Records what a rollback runs: every layer's replay of the tokens it
@@ -509,7 +524,7 @@ impl<'m> VulkanModel<'m> {
         tokens: &[u32],
         all_logits: bool,
     ) -> kinetic_vulkan::Result<Forward> {
-        let out = self.forward(state, tokens, all_logits, Head::Logits)?;
+        let out = self.forward(state, tokens, all_logits, Head::Logits, true)?;
         Ok(Forward {
             logits: out.logits,
             hidden: out.hidden,
@@ -525,7 +540,7 @@ impl<'m> VulkanModel<'m> {
         tokens: &[u32],
         all_rows: bool,
     ) -> kinetic_vulkan::Result<(Vec<u32>, Vec<f32>)> {
-        let out = self.forward(state, tokens, all_rows, Head::Greedy)?;
+        let out = self.forward(state, tokens, all_rows, Head::Greedy, true)?;
         Ok((out.greedy, out.hidden))
     }
 
@@ -539,7 +554,7 @@ impl<'m> VulkanModel<'m> {
         tokens: &[u32],
         all_rows: bool,
     ) -> kinetic_vulkan::Result<Forward> {
-        let out = self.forward(state, tokens, all_rows, Head::Greedy)?;
+        let out = self.forward(state, tokens, all_rows, Head::Greedy, true)?;
         let vocab = self.n_vocab();
         let mut logits = vec![f32::NEG_INFINITY; out.greedy.len() * vocab];
         for (row, (&t, &v)) in out.greedy.iter().zip(&out.top).enumerate() {
@@ -557,7 +572,27 @@ impl<'m> VulkanModel<'m> {
         state: &mut VulkanState,
         tokens: &[u32],
     ) -> kinetic_vulkan::Result<Vec<f32>> {
-        Ok(self.forward(state, tokens, false, Head::None)?.hidden)
+        Ok(self.forward(state, tokens, false, Head::None, true)?.hidden)
+    }
+
+    /// Advances the sequence, leaving its outputs on the device.
+    pub fn advance_state(
+        &self,
+        state: &mut VulkanState,
+        tokens: &[u32],
+    ) -> kinetic_vulkan::Result<()> {
+        self.forward(state, tokens, false, Head::None, false)
+            .map(|_| ())
+    }
+
+    fn last_logits(
+        &self,
+        state: &mut VulkanState,
+        tokens: &[u32],
+    ) -> kinetic_vulkan::Result<Vec<f32>> {
+        Ok(self
+            .forward(state, tokens, false, Head::Logits, false)?
+            .logits)
     }
 
     /// Marks the current length so a later [`VulkanModel::rollback`] can
@@ -617,13 +652,14 @@ impl<'m> VulkanModel<'m> {
         tokens: &[u32],
         all_rows: bool,
         output: Head,
+        read_hidden: bool,
     ) -> kinetic_vulkan::Result<Output> {
         self.check(state, tokens)?;
         let (d, vocab) = (self.n_embd, self.n_vocab());
         let mut out = Output {
             greedy: Vec::new(),
             top: Vec::new(),
-            hidden: Vec::with_capacity(tokens.len() * d),
+            hidden: Vec::with_capacity(if read_hidden { tokens.len() * d } else { 0 }),
             logits: Vec::new(),
         };
         let mut rest = tokens;
@@ -668,9 +704,11 @@ impl<'m> VulkanModel<'m> {
             self.ropes.fill(&mut w.batch, state.pos, n);
             let x = &mut w.embedded.as_mut_slice()[..n * d];
             embed_into(&self.embd, self.embd_scale, chunk, x);
-            match (head.len(), output) {
-                (0, _) => pass.hidden.launch()?,
-                (rows, Head::Logits) => pass.launch_logits(&self.gpu.device, vocab, rows)?,
+            match (head.len(), output, read_hidden) {
+                (0, _, false) => pass.state.launch()?,
+                (0, _, true) => pass.state.launch_then(&pass.hidden)?,
+                (1, Head::Logits, false) => pass.state.launch_then(&pass.last_logits)?,
+                (rows, Head::Logits, _) => pass.launch_logits(&self.gpu.device, vocab, rows)?,
                 _ => pass.greedy.launch()?,
             }
 
@@ -681,7 +719,9 @@ impl<'m> VulkanModel<'m> {
                     out.top.push(f32::from_bits(pair[1]));
                 }
             }
-            out.hidden.extend_from_slice(&w.hidden.as_slice()[..n * d]);
+            if read_hidden {
+                out.hidden.extend_from_slice(&w.hidden.as_slice()[..n * d]);
+            }
             if output == Head::Logits {
                 let rows = &w.logits_host.as_slice()[..head.len() * vocab];
                 out.logits.extend_from_slice(rows);

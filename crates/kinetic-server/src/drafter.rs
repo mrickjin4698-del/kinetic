@@ -15,6 +15,10 @@ pub enum Source<M: Predictor> {
 }
 
 impl<M: Predictor> Drafter<M> for Source<M> {
+    fn observes_prompt_hidden(&self) -> bool {
+        matches!(self, Self::Mtp(_))
+    }
+
     fn observe(&mut self, model: &M, tokens: &[u32], hidden: &[f32]) {
         match self {
             Source::Lookup(d) => Drafter::<M>::observe(d, model, tokens, hidden),

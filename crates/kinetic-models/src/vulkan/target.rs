@@ -35,6 +35,10 @@ impl Target for VulkanModel<'_> {
         device(VulkanModel::advance(self, state, tokens))
     }
 
+    fn advance_state(&self, state: &mut VulkanState, tokens: &[u32]) {
+        device(VulkanModel::advance_state(self, state, tokens));
+    }
+
     fn logits(
         &self,
         state: &mut VulkanState,

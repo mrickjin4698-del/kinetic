@@ -53,6 +53,12 @@ impl<D> Ensemble<D> {
 }
 
 impl<M: Target, D: Drafter<M>> Drafter<M> for Ensemble<D> {
+    fn observes_prompt_hidden(&self) -> bool {
+        self.sources
+            .iter()
+            .any(|s| s.drafter.observes_prompt_hidden())
+    }
+
     fn observe(&mut self, model: &M, tokens: &[u32], hidden: &[f32]) {
         for s in &mut self.sources {
             s.drafter.observe(model, tokens, hidden);
