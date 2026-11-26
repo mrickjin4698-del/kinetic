@@ -43,6 +43,7 @@ impl Allocation {
         bytes: u64,
         usage: vk::BufferUsageFlags,
         required: vk::MemoryPropertyFlags,
+        preferred: vk::MemoryPropertyFlags,
         prefer_local: bool,
     ) -> Result<Allocation> {
         let info = vk::BufferCreateInfo::default()
@@ -60,7 +61,7 @@ impl Allocation {
         // SAFETY: `buffer` belongs to this device.
         let needs = unsafe { raw.get_buffer_memory_requirements(buffer) };
         let mut last = vk::Result::ERROR_OUT_OF_DEVICE_MEMORY;
-        for ty in device.memory_types(needs.memory_type_bits, required, prefer_local) {
+        for ty in device.memory_types(needs.memory_type_bits, required, preferred, prefer_local) {
             if device.heap_size(ty) < needs.size {
                 continue;
             }
@@ -134,6 +135,7 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
             vk::BufferUsageFlags::STORAGE_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_SRC
                 | vk::BufferUsageFlags::TRANSFER_DST,
+            vk::MemoryPropertyFlags::empty(),
             vk::MemoryPropertyFlags::empty(),
             true,
         )?;
@@ -246,7 +248,7 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
             std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), size_of_val(dst))
         };
         let start = at * size_of::<T>();
-        let mut staging = Staging::new(self.device(), bytes.len())?;
+        let mut staging = Staging::new_readback(self.device(), bytes.len())?;
         for (i, chunk) in bytes.chunks_mut(STAGING_BYTES).enumerate() {
             staging.copy(
                 self.raw(),
@@ -282,6 +284,20 @@ pub struct HostBuffer<T: DeviceCopy> {
 impl<T: DeviceCopy> HostBuffer<T> {
     /// Allocates `len` zeroed elements.
     pub fn new(device: &Rc<Device>, len: usize) -> Result<Self> {
+        Self::with_preference(device, len, vk::MemoryPropertyFlags::empty())
+    }
+
+    /// Allocates zeroed elements for reading device results, preferring
+    /// host-cached coherent memory where the device offers it.
+    pub fn new_readback(device: &Rc<Device>, len: usize) -> Result<Self> {
+        Self::with_preference(device, len, vk::MemoryPropertyFlags::HOST_CACHED)
+    }
+
+    fn with_preference(
+        device: &Rc<Device>,
+        len: usize,
+        preferred: vk::MemoryPropertyFlags,
+    ) -> Result<Self> {
         let bytes = len
             .checked_mul(size_of::<T>())
             .ok_or_else(|| Error::Shape(format!("host buffer of {len} elements")))?;
@@ -292,6 +308,7 @@ impl<T: DeviceCopy> HostBuffer<T> {
                 | vk::BufferUsageFlags::TRANSFER_SRC
                 | vk::BufferUsageFlags::TRANSFER_DST,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            preferred,
             false,
         )?;
         // SAFETY: the memory is host-visible, not yet mapped, and freed only
@@ -408,6 +425,12 @@ impl Staging {
     fn new(device: &Rc<Device>, bytes: usize) -> Result<Staging> {
         Ok(Staging {
             buf: HostBuffer::new(device, bytes.min(STAGING_BYTES))?,
+        })
+    }
+
+    fn new_readback(device: &Rc<Device>, bytes: usize) -> Result<Staging> {
+        Ok(Staging {
+            buf: HostBuffer::new_readback(device, bytes.min(STAGING_BYTES))?,
         })
     }
 

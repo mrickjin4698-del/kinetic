@@ -189,6 +189,11 @@ impl<T: DeviceCopy> HostBuffer<T> {
         })
     }
 
+    /// Allocates zeroed, shared elements for reading device results.
+    pub fn new_readback(device: &Rc<Device>, len: usize) -> Result<Self> {
+        Self::new(device, len)
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }

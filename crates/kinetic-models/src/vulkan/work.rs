@@ -104,10 +104,10 @@ impl Work {
             ffn: inputs(ffn)?,
             logits: f32s(head * vocab)?,
             best: DeviceBuffer::new(dev, 2 * head.max(1))?,
-            logits_host: HostBuffer::new(dev, (head * vocab).max(1))?,
+            logits_host: HostBuffer::new_readback(dev, (head * vocab).max(1))?,
             embedded: HostBuffer::new(dev, rows * d)?,
-            hidden: HostBuffer::new(dev, rows * d)?,
-            greedy: HostBuffer::new(dev, 2 * head.max(1))?,
+            hidden: HostBuffer::new_readback(dev, rows * d)?,
+            greedy: HostBuffer::new_readback(dev, 2 * head.max(1))?,
             batch,
             matrix_scratch: if gpu.kernels.matrix() && rows > PROMPT_SHORT {
                 match MatrixScratch::new(dev, matrix_width, rows) {

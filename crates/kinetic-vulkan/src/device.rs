@@ -202,11 +202,13 @@ impl Device {
     /// Memory types allowed by `bits` with all of `required`, in order of
     /// preference: device-local first when `prefer_local`, host memory
     /// after, so allocations larger than a small device-local heap (as on
-    /// integrated GPUs) still succeed.
+    /// integrated GPUs) still succeed. Within each group, types with every
+    /// preferred property come first.
     pub(crate) fn memory_types(
         &self,
         bits: u32,
         required: vk::MemoryPropertyFlags,
+        preferred: vk::MemoryPropertyFlags,
         prefer_local: bool,
     ) -> Vec<u32> {
         let memory = &self.physical.memory;
@@ -219,7 +221,10 @@ impl Device {
             .collect();
         types.sort_by_key(|&i| {
             let flags = memory.memory_types[i as usize].property_flags;
-            flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL) != prefer_local
+            (
+                flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL) != prefer_local,
+                !flags.contains(preferred),
+            )
         });
         types
     }
