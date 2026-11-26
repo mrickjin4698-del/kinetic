@@ -23,6 +23,7 @@ struct Shape {
     q_norm: u32,
     k_norm: u32,
     slots: u32,
+    packed_kv: u32,
 }
 
 // Bits of `flags`.
@@ -124,7 +125,9 @@ fn main(
         let row = ((batch[1] + t) % shape.slots * kv_dim + head) / 2u;
         for (var i = lane; i < hd / 2u; i += 32u) {
             let word = pack2x16float(vec2<f32>(qkv[base + 2u * i], qkv[base + 2u * i + 1u]));
-            if keys {
+            if shape.packed_kv != 0u {
+                kc[2u * (row + i) + select(1u, 0u, keys)] = word;
+            } else if keys {
                 kc[row + i] = word;
             } else {
                 vc[row + i] = word;

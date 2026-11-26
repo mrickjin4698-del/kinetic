@@ -93,8 +93,9 @@ impl AttentionShape {
 /// a window the last ones in a ring with room for a batch more, so a pass
 /// and a rollback never overwrite a position still seen.
 pub struct KvCache {
-    k: DeviceBuffer<u32>,
-    v: DeviceBuffer<u32>,
+    // Without a separate values buffer, data holds (key, value) word pairs.
+    data: DeviceBuffer<u32>,
+    values: Option<DeviceBuffer<u32>>,
     positions: usize,
     rows: usize,
     slots: usize,
@@ -113,10 +114,32 @@ impl KvCache {
             .window
             .map_or(positions, |w| (w + rows).min(positions))
             .max(1);
-        let words = slots * shape.kv_dim() / 2;
+        let words = slots
+            .checked_mul(shape.kv_dim() / 2)
+            .ok_or_else(|| Error::Shape("attention cache is too large".into()))?;
+        let packed_words = words.checked_mul(2).filter(|&count| {
+            !cfg!(metal_driver)
+                && shape.head_dim == 256
+                && count as u64 <= device.info().max_buffer_bytes / 4
+        });
+        let packed = match packed_words
+            .map(|n| DeviceBuffer::new(device, n))
+            .transpose()
+        {
+            Ok(data) => data,
+            Err(e) if e.out_of_memory() => None,
+            Err(e) => return Err(e),
+        };
+        let (data, values) = match packed {
+            Some(data) => (data, None),
+            None => (
+                DeviceBuffer::new(device, words)?,
+                Some(DeviceBuffer::new(device, words)?),
+            ),
+        };
         Ok(KvCache {
-            k: DeviceBuffer::new(device, words)?,
-            v: DeviceBuffer::new(device, words)?,
+            data,
+            values,
             positions,
             rows,
             slots,
@@ -134,33 +157,54 @@ impl KvCache {
 
     /// The keys and values of slots `slots`, as f16 bits.
     pub fn save(&self, slots: Range<usize>) -> Result<(Vec<u16>, Vec<u16>)> {
-        let row = self.k.len() / self.slots;
-        let read = |b: &DeviceBuffer<u32>| -> Result<Vec<u16>> {
+        let row = self.data.len() / self.slots;
+        let unpack = |word: u32| [word as u16, (word >> 16) as u16];
+        let read = |buf: &DeviceBuffer<u32>| -> Result<Vec<u32>> {
             let mut words = vec![0; slots.len() * row];
-            b.copy_range_to(slots.start * row, &mut words)?;
-            Ok(words
-                .iter()
-                .flat_map(|w| [*w as u16, (w >> 16) as u16])
-                .collect())
+            buf.copy_range_to(slots.start * row, &mut words)?;
+            Ok(words)
         };
-        Ok((read(&self.k)?, read(&self.v)?))
+        let words = read(&self.data)?;
+        if let Some(values) = &self.values {
+            let k = words.into_iter().flat_map(unpack).collect();
+            let v = read(values)?.into_iter().flat_map(unpack).collect();
+            return Ok((k, v));
+        }
+        let mut k = Vec::with_capacity(words.len());
+        let mut v = Vec::with_capacity(words.len());
+        for pair in words.chunks_exact(2) {
+            k.extend(unpack(pair[0]));
+            v.extend(unpack(pair[1]));
+        }
+        Ok((k, v))
     }
 
     /// Writes keys and values as [`KvCache::save`] gives them from slot `at`.
     pub fn load(&mut self, at: usize, k: &[u16], v: &[u16]) -> Result<()> {
-        let row = self.k.len() / self.slots;
-        let words = |x: &[u16]| -> Vec<u32> {
-            x.chunks_exact(2)
-                .map(|p| u32::from(p[0]) | (u32::from(p[1]) << 16))
-                .collect()
-        };
-        self.k.copy_range_from(at * row, &words(k))?;
-        self.v.copy_range_from(at * row, &words(v))
+        let start = at * (self.data.len() / self.slots);
+        let pack = |p: &[u16]| u32::from(p[0]) | (u32::from(p[1]) << 16);
+        if let Some(values) = &mut self.values {
+            let words = |x: &[u16]| x.chunks_exact(2).map(pack).collect::<Vec<_>>();
+            self.data.copy_range_from(start, &words(k))?;
+            return values.copy_range_from(start, &words(v));
+        }
+        let (nk, nv) = (k.len() / 2, v.len() / 2);
+        let mut words = vec![0; 2 * nk.max(nv)];
+        if nk != nv {
+            // Preserve any keys or values outside the shorter write.
+            self.data.copy_range_to(start, &mut words)?;
+        }
+        for (i, values) in [k, v].into_iter().enumerate() {
+            for (pair, p) in words.chunks_exact_mut(2).zip(values.chunks_exact(2)) {
+                pair[i] = pack(p);
+            }
+        }
+        self.data.copy_range_from(start, &words)
     }
 
     /// Device bytes held.
     pub fn size_bytes(&self) -> usize {
-        8 * self.k.len()
+        4 * (self.data.len() + self.values.as_ref().map_or(0, DeviceBuffer::len))
     }
 }
 
@@ -202,7 +246,7 @@ impl Kernels {
         let fits = qkv.len() >= rows * shape.qkv_len()
             && cache.positions >= batch.positions()
             && cache.rows >= rows
-            && 2 * cache.k.len() == cache.slots * shape.kv_dim()
+            && cache.size_bytes() == 4 * cache.slots * shape.kv_dim()
             && out.width() == shape.n_head * hd
             && out.rows() >= rows
             && rope_table + rows * shape.rope_dims <= batch.table_words()
@@ -226,23 +270,39 @@ impl Kernels {
             AttentionGate::PerValue => 1,
             AttentionGate::PerHead => 2,
         };
-        // Pair consecutive query heads within each KV head.
-        let pair_heads = commands.prompt() && (shape.n_head / shape.n_head_kv).is_multiple_of(2);
-        let (attend, heads) = match hd {
-            64 => (&self.attend_64, 1),
+        let packed = cache.values.is_none();
+        let (planar, index) = match hd {
+            64 => (&self.attend_64, 0),
             128 => (&self.attend_128, 1),
-            _ if pair_heads => self
-                .attend_256_grouped
-                .as_ref()
-                .map_or((&self.attend_256, 1), |k| (k, 2)),
-            _ => (&self.attend_256, 1),
+            _ => (&self.attend_256, 2),
         };
+        let single = if packed {
+            &self
+                .attend_packed
+                .as_ref()
+                .expect("packed Vulkan attention")[index]
+        } else {
+            planar
+        };
+        let grouped = if packed {
+            self.attend_256_packed_grouped.as_ref()
+        } else {
+            self.attend_256_grouped.as_ref()
+        };
+        // Pair consecutive query heads within each KV head.
+        let pair_heads =
+            hd == 256 && commands.prompt() && (shape.n_head / shape.n_head_kv).is_multiple_of(2);
+        let (attend, heads) = grouped
+            .filter(|_| pair_heads)
+            .map_or((single, 1), |k| (k, 2));
+        let values = cache.values.as_ref().unwrap_or(&self.single).allocation();
         let batch_words = batch.device().allocation();
         let [ox, oq, od] = out.outputs();
-        // SAFETY: rope.wgsl takes the batch, qkv, consts and both caches at
-        // bindings 0..4 and then its shape; attend.wgsl the batch, qkv, both
-        // caches and the three output buffers at 0..6 and its shape. Every
-        // index they form stays inside the sizes checked above: token rows
+        // SAFETY: rope.wgsl takes the batch, qkv, consts and cache buffers
+        // at bindings 0..=4; attend takes the batch, qkv, cache and outputs
+        // at 0..=6. With packed data the separate values binding is unused.
+        // Every index they form stays inside the sizes checked above:
+        // token rows
         // below the batch's rows, positions below its positions, constants
         // and table words where the offsets say. Workgroups past the pass's
         // tokens return early.
@@ -253,8 +313,8 @@ impl Kernels {
                     batch_words,
                     qkv.allocation(),
                     consts.data.allocation(),
-                    cache.k.allocation(),
-                    cache.v.allocation(),
+                    cache.data.allocation(),
+                    values,
                 ],
                 &[
                     shape.n_head as u32,
@@ -270,6 +330,7 @@ impl Kernels {
                     word(consts.q_norm),
                     word(consts.k_norm),
                     cache.slots as u32,
+                    packed as u32,
                 ],
                 [(shape.n_head + 2 * shape.n_head_kv) as u32, rows as u32, 1],
             );
@@ -278,8 +339,8 @@ impl Kernels {
                 &[
                     batch_words,
                     qkv.allocation(),
-                    cache.k.allocation(),
-                    cache.v.allocation(),
+                    cache.data.allocation(),
+                    values,
                     ox,
                     oq,
                     od,

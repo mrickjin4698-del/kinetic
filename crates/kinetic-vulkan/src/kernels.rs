@@ -67,6 +67,8 @@ pub struct Kernels {
     pub(crate) attend_128: Rc<Kernel>,
     pub(crate) attend_256: Rc<Kernel>,
     pub(crate) attend_256_grouped: Option<Rc<Kernel>>,
+    pub(crate) attend_packed: Option<[Rc<Kernel>; 3]>,
+    pub(crate) attend_256_packed_grouped: Option<Rc<Kernel>>,
     read_sum: Rc<Kernel>,
     /// The batch words of a pass of one token, for GEMVs outside a model.
     pub(crate) single: DeviceBuffer<u32>,
@@ -178,7 +180,7 @@ impl Kernels {
             norm: Kernel::new(device, "norm", spirv!("norm"), 8, 4)?,
             swiglu: Kernel::new(device, "swiglu", spirv!("swiglu"), 5, 1)?,
             argmax: Kernel::new(device, "argmax", spirv!("argmax"), 3, 1)?,
-            rope: Kernel::new(device, "rope", spirv!("rope"), 5, 13)?,
+            rope: Kernel::new(device, "rope", spirv!("rope"), 5, 14)?,
             short_conv: Kernel::new(device, "short_conv", spirv!("short_conv"), 7, 3)?,
             delta_conv: Kernel::new(device, "delta_conv", spirv!("delta_conv"), 6, 8)?,
             delta_prepare_norms: Kernel::new(
@@ -202,6 +204,23 @@ impl Kernels {
             attend_256: attend("attend_256", spirv!("attend_256"))?,
             attend_256_grouped: matrix
                 .then(|| attend("attend_256_grouped", spirv!("attend_256_grouped")))
+                .transpose()?,
+            attend_packed: (!cfg!(metal_driver))
+                .then(|| -> Result<_> {
+                    Ok([
+                        attend("attend_64_packed", spirv!("attend_64_packed"))?,
+                        attend("attend_128_packed", spirv!("attend_128_packed"))?,
+                        attend("attend_256_packed", spirv!("attend_256_packed"))?,
+                    ])
+                })
+                .transpose()?,
+            attend_256_packed_grouped: matrix
+                .then(|| {
+                    attend(
+                        "attend_256_packed_grouped",
+                        spirv!("attend_256_packed_grouped"),
+                    )
+                })
                 .transpose()?,
             read_sum: Kernel::new(device, "read_sum", spirv!("read_sum"), 2, 1)?,
             single: DeviceBuffer::from_slice(device, &[1, 0, 0, 1])?,

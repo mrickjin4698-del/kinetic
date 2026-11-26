@@ -627,3 +627,83 @@ fn delta_journal_mask_matches_modulo_through_replay() {
         assert_eq!(bits(masked.save().unwrap()), bits(modulo.save().unwrap()));
     }
 }
+
+#[test]
+fn packed_cache_matches_planar_with_a_different_head_width() {
+    for gpu in gpus() {
+        let shape = AttentionShape {
+            n_head: 4,
+            n_head_kv: 2,
+            head_dim: 128,
+            rope_dims: 0,
+            rope_adjacent: false,
+            norm_after_rope: false,
+            gate: AttentionGate::None,
+            window: None,
+            scale: 0.125,
+            eps: 1e-5,
+        };
+        let wide = AttentionShape {
+            n_head: 2,
+            n_head_kv: 1,
+            head_dim: 256,
+            ..shape.clone()
+        };
+        let dev = &gpu.device;
+        let positions = 6;
+        let pos = positions - 1;
+        let mut packed = KvCache::new(dev, &wide, positions, 1).unwrap();
+        let mut planar = KvCache::new(dev, &shape, positions, 1).unwrap();
+        let mut rng = Lcg(38);
+        let keys: Vec<_> = (0..pos * shape.kv_dim())
+            .map(|_| f16::from_f32(rng.f32()).to_bits())
+            .collect();
+        let values: Vec<_> = (0..keys.len())
+            .map(|_| f16::from_f32(rng.f32()).to_bits())
+            .collect();
+        let updated = [0x3c00, 0x3800];
+        for cache in [&mut packed, &mut planar] {
+            cache.load(0, &keys, &values).unwrap();
+            assert_eq!(cache.save(0..pos).unwrap(), (keys.clone(), values.clone()));
+            cache.load(1, &updated, &[]).unwrap();
+            let (k, v) = cache.save(1..2).unwrap();
+            let stride = shape.kv_dim();
+            assert_eq!(k[..2], updated);
+            assert_eq!(k[2..], keys[stride + 2..2 * stride]);
+            assert_eq!(v, values[stride..2 * stride]);
+        }
+
+        let mut batch = Batch::new(dev, 1, 0, positions, 0).unwrap();
+        batch.set(1, pos, 0..0, None).unwrap();
+        let input: Vec<_> = (0..shape.qkv_len()).map(|_| rng.f32()).collect();
+        let mut qkv = DeviceBuffer::new(dev, input.len()).unwrap();
+        let constants = DeviceBuffer::from_slice(dev, &[0.0]).unwrap();
+        let consts = QkvConsts {
+            data: &constants,
+            q_norm: None,
+            k_norm: None,
+            bias: None,
+        };
+        let out = GemvInput::batch(dev, shape.n_head * shape.head_dim, 1).unwrap();
+        let mut attend = |cache| {
+            qkv.copy_from(&input).unwrap();
+            let mut commands = Commands::new(dev).unwrap();
+            batch.record_upload(&mut commands).unwrap();
+            gpu.kernels
+                .attention(&batch, &shape, &qkv, &consts, 0, cache, &out, &mut commands)
+                .unwrap();
+            commands.submit().unwrap();
+            out.values()
+                .to_vec()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(attend(&packed), attend(&planar));
+        assert_eq!(
+            packed.save(0..positions).unwrap(),
+            planar.save(0..positions).unwrap()
+        );
+    }
+}

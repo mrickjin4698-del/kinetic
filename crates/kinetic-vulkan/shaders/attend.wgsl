@@ -28,8 +28,6 @@ var<immediate> shape: Shape;
 
 @group(0) @binding(0) var<storage, read> batch: array<u32>;
 @group(0) @binding(1) var<storage, read> qkv: array<f32>;
-@group(0) @binding(2) var<storage, read> kc: array<u32>;
-@group(0) @binding(3) var<storage, read> vc: array<u32>;
 @group(0) @binding(4) var<storage, read_write> ox: array<f32>;
 @group(0) @binding(5) var<storage, read_write> oq: array<u32>;
 @group(0) @binding(6) var<storage, read_write> od: array<vec2<f32>>;
@@ -95,10 +93,14 @@ fn main(
             let row1 = offset1 + first;
             var qk0 = 0.0;
             var qk1 = 0.0;
+            var values: array<vec2<u32>, PAIRS>;
             for (var k = 0u; k < PAIRS; k++) {
                 let pair = 32u * k;
-                qk0 += dot(q[k], unpack2x16float(kc[row0 + pair]));
-                qk1 += dot(q[k], unpack2x16float(kc[row1 + pair]));
+                let a = load_for_score(row0 + pair);
+                let b = load_for_score(row1 + pair);
+                values[k] = vec2<u32>(a.y, b.y);
+                qk0 += dot(q[k], unpack2x16float(a.x));
+                qk1 += dot(q[k], unpack2x16float(b.x));
             }
             let s0 = subgroupAdd(qk0);
             let s1 = subgroupAdd(qk1);
@@ -112,8 +114,9 @@ fn main(
             l = l * c1 + e1;
             for (var k = 0u; k < PAIRS; k++) {
                 let pair = 32u * k;
-                let v0 = unpack2x16float(vc[row0 + pair]);
-                let v1 = unpack2x16float(vc[row1 + pair]);
+                let cached = values[k];
+                let v0 = unpack2x16float(load_value(row0 + pair, cached.x));
+                let v1 = unpack2x16float(load_value(row1 + pair, cached.y));
                 acc[k] = acc[k] * c0 + e0 * v0;
                 acc[k] = acc[k] * c1 + e1 * v1;
             }
@@ -124,8 +127,11 @@ fn main(
     for (; p < len; p += SUBGROUPS) {
         let row = cache_offset + first;
         var qk = 0.0;
+        var values: array<u32, PAIRS>;
         for (var k = 0u; k < PAIRS; k++) {
-            qk += dot(q[k], unpack2x16float(kc[row + 32u * k]));
+            let pair = load_for_score(row + 32u * k);
+            values[k] = pair.y;
+            qk += dot(q[k], unpack2x16float(pair.x));
         }
         let s = subgroupAdd(qk);
         let next = max(m, s);
@@ -133,7 +139,7 @@ fn main(
         let e = exp(s - next);
         l = l * c + e;
         for (var k = 0u; k < PAIRS; k++) {
-            acc[k] = acc[k] * c + e * unpack2x16float(vc[row + 32u * k]);
+            acc[k] = acc[k] * c + e * unpack2x16float(load_value(row + 32u * k, values[k]));
         }
         m = next;
         cache_offset = next_offset(cache_offset, word_step, wrap_at);
