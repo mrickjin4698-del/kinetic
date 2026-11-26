@@ -28,7 +28,12 @@ const KERNELS: &[(&str, &str, &[&str])] = &[
     ("rope", "", &["rope"]),
     ("short_conv", "", &["short_conv", "put_q8"]),
     ("delta_conv", "", &["delta_conv"]),
-    ("delta_rule", "", &["delta_rule"]),
+    (
+        "delta_prepare_norms",
+        "",
+        &["delta_qk_scale", "delta_prepare_norms"],
+    ),
+    ("delta_rule", "", &["delta_qk_scale", "delta_rule"]),
     ("gated_norm", "", &["gated_norm", "put_q8"]),
     ("attend_64", "const PAIRS: u32 = 1u;", &["attend", "put_q8"]),
     (

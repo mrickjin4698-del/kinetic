@@ -6,7 +6,7 @@ use crate::device::Device;
 use crate::error::{Error, Result};
 use crate::gemv::GemvInput;
 use crate::kernels::Kernels;
-use crate::memory::{Allocation, DeviceBuffer};
+use crate::memory::DeviceBuffer;
 use crate::short_conv::ConvRing;
 
 /// The key head size the recurrence kernel handles, four values per lane.
@@ -49,7 +49,9 @@ impl DeltaShape {
     /// Four-word alignment lets the recurrence load each lane's query and
     /// key as a vector, even when the number of value heads is odd.
     fn journal_stride(&self) -> usize {
-        (self.channels() + 2 * self.n_v_heads).next_multiple_of(4)
+        // After the raw channels and head scalars, one vector per key head
+        // holds the two normalization factors for a long prompt pass.
+        (self.channels() + 2 * self.n_v_heads).next_multiple_of(4) + 4 * self.n_k_heads
     }
 
     fn check(&self) -> Result<()> {
@@ -213,7 +215,7 @@ impl Kernels {
                 ],
                 [(channels + nv).div_ceil(256) as u32, rows as u32, 1],
             );
-            self.record_rule(shape, state, rec, false, b, commands);
+            self.record_rule(shape, state, rec, false, batch, commands);
             commands.dispatch(
                 &self.gated_norm,
                 &[
@@ -251,9 +253,8 @@ impl Kernels {
     ) -> Result<()> {
         shape.check()?;
         state.check(shape, batch)?;
-        let b = batch.device().allocation();
         // SAFETY: as in `delta_net`; a replay writes only the matrices.
-        unsafe { self.record_rule(shape, state, rec, true, b, commands) };
+        unsafe { self.record_rule(shape, state, rec, true, batch, commands) };
         Ok(())
     }
 
@@ -266,16 +267,38 @@ impl Kernels {
         state: &DeltaState,
         rec: &DeviceBuffer<f32>,
         replay: bool,
-        batch: &Rc<Allocation>,
+        batch: &Batch,
         commands: &mut Commands,
     ) {
         let rows = shape.value_dim();
+        let batch_words = batch.device().allocation();
+        let journal = state.journal.allocation();
+        let stride = shape.journal_stride() as u32;
+        // SAFETY: the preparation visits at most batch.rows() journal slots,
+        // including any tokens after the checkpoint that precede the pass.
+        // Each head writes its own vector at the end of its journal row.
+        let prepared = !replay && commands.prompt() && batch.rows() > 64;
+        if prepared {
+            unsafe {
+                commands.dispatch(
+                    &self.delta_prepare_norms,
+                    &[batch_words, journal],
+                    &[
+                        shape.n_k_heads as u32,
+                        state.rows as u32,
+                        stride,
+                        shape.eps.to_bits(),
+                    ],
+                    [shape.n_k_heads.div_ceil(4) as u32, batch.rows() as u32, 1],
+                );
+            }
+        }
         // SAFETY: matches delta_rule.wgsl; the caller checked the sizes.
         unsafe {
             commands.dispatch(
                 &self.delta_rule,
                 &[
-                    batch,
+                    batch_words,
                     state.journal.allocation(),
                     state.state.allocation(),
                     rec.allocation(),
@@ -288,7 +311,8 @@ impl Kernels {
                     state.rows as u32,
                     shape.eps.to_bits(),
                     replay as u32,
-                    shape.journal_stride() as u32,
+                    stride,
+                    prepared as u32,
                 ],
                 [rows.div_ceil(4) as u32, 1, 1],
             )

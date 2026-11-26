@@ -20,9 +20,8 @@ struct Shape {
     eps: f32,
     replay: u32,
     journal_stride: u32,
+    prepared_norms: u32,
 }
-
-const DK: u32 = 128u;
 
 var<immediate> shape: Shape;
 
@@ -33,11 +32,6 @@ var<immediate> shape: Shape;
 
 fn journal_word(base: u32, word: u32) -> f32 {
     return journal[base + word / 4u][word % 4u];
-}
-
-fn l2_normed(x: vec4<f32>) -> vec4<f32> {
-    let norm = sqrt(subgroupAdd(dot(x, x)));
-    return x * (1.0 / max(norm, shape.eps));
 }
 
 @compute @workgroup_size(128)
@@ -72,14 +66,25 @@ fn main(
     var s = state[at];
     for (var p = batch[4]; p < end; p++) {
         let base = p % shape.journal_slots * jstride;
-        let k = l2_normed(journal[base + key_at]);
+        let raw_k = journal[base + key_at];
+        var scales: vec2<f32>;
+        if shape.prepared_norms != 0u {
+            scales = journal[base + jstride - shape.n_k_heads + kh].xy;
+        } else {
+            scales.y = delta_norm_scale(raw_k, shape.eps);
+        }
+        let k = raw_k * scales.y;
         let v = journal_word(base, value_at);
         let decay = journal_word(base, decay_at);
         let b = journal_word(base, beta_at);
         let delta = (v - decay * subgroupAdd(dot(s, k))) * b;
         s = s * decay + k * delta;
         if p >= pos0 {
-            let q = l2_normed(journal[base + query_at]) * q_scale;
+            let raw_q = journal[base + query_at];
+            if shape.prepared_norms == 0u {
+                scales.x = delta_norm_scale(raw_q, shape.eps);
+            }
+            let q = raw_q * scales.x * q_scale;
             let o = subgroupAdd(dot(s, q));
             if lane == 0u {
                 out[(p - pos0) * value_dim + row] = o;
