@@ -60,9 +60,11 @@ fn main(
     let jstride = shape.journal_stride / 4u;
     let pos0 = batch[1];
     var end = pos0 + batch[0];
-    if shape.replay != 0u {
+    // The paired kernel only runs live passes with precomputed norms.
+    if !PAIRED && shape.replay != 0u {
         end = pos0;
     }
+    let prepared = PAIRED || shape.prepared_norms != 0u;
     let q_scale = 1.0 / sqrt(f32(DK));
 
     let at = row * (DK / 4u) + lane;
@@ -79,7 +81,7 @@ fn main(
         let base = journal_slot * jstride;
         let raw_k = journal[base + key_at];
         var scales: vec2<f32>;
-        if shape.prepared_norms != 0u {
+        if prepared {
             scales = journal[base + jstride - shape.n_k_heads + kh].xy;
         } else {
             scales.y = delta_norm_scale(raw_k, shape.eps);
@@ -99,7 +101,7 @@ fn main(
         }
         if p >= pos0 {
             let raw_q = journal[base + query_at];
-            if shape.prepared_norms == 0u {
+            if !prepared {
                 scales.x = delta_norm_scale(raw_q, shape.eps);
             }
             let q = raw_q * scales.x * q_scale;
