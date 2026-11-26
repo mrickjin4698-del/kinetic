@@ -293,14 +293,20 @@ impl Kernels {
                 );
             }
         }
+        let masked = state.rows.is_power_of_two();
+        let paired = self
+            .delta_rule_paired
+            .as_ref()
+            .filter(|_| prepared && masked);
+        let (rule, rows_per_group) = match paired {
+            Some(rule) => (rule, 8),
+            None if masked => (&self.delta_rule_masked, 4),
+            None => (&self.delta_rule, 4),
+        };
         // SAFETY: matches delta_rule.wgsl; the caller checked the sizes.
         unsafe {
             commands.dispatch(
-                if state.rows.is_power_of_two() {
-                    &self.delta_rule_masked
-                } else {
-                    &self.delta_rule
-                },
+                rule,
                 &[
                     batch_words,
                     state.journal.allocation(),
@@ -318,7 +324,7 @@ impl Kernels {
                     stride,
                     prepared as u32,
                 ],
-                [rows.div_ceil(4) as u32, 1, 1],
+                [rows.div_ceil(rows_per_group) as u32, 1, 1],
             )
         };
     }

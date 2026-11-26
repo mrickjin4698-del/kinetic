@@ -1,5 +1,5 @@
-// The recurrence of a gated delta-rule layer. Each subgroup owns one row of
-// one value head's state, `head_k_dim` = 128 values, four per lane, and
+// The recurrence of a gated delta-rule layer. Each subgroup owns one or two
+// rows of one value head's state, with four values per lane per row, and
 // applies the delta rule
 //     S = decay * S;  S += b * (v - S k) k^T
 // for every position in turn, then reads out o = S q for the pass's tokens.
@@ -34,6 +34,13 @@ fn journal_word(base: u32, word: u32) -> f32 {
     return journal[base + word / 4u][word % 4u];
 }
 
+const PAIRED: bool = ROWS_PER_SUBGROUP == 2u;
+
+fn update(s: vec4<f32>, k: vec4<f32>, v: f32, decay: f32, b: f32) -> vec4<f32> {
+    let delta = (v - decay * subgroupAdd(dot(s, k))) * b;
+    return s * decay + k * delta;
+}
+
 @compute @workgroup_size(128)
 fn main(
     @builtin(workgroup_id) group: vec3<u32>,
@@ -41,7 +48,7 @@ fn main(
     @builtin(subgroup_invocation_id) lane: u32,
 ) {
     let dv = shape.head_v_dim;
-    let row = group.x * 4u + slot;
+    let row = (group.x * 4u + slot) * ROWS_PER_SUBGROUP;
     if row >= shape.n_v_heads * dv {
         return;
     }
@@ -64,6 +71,10 @@ fn main(
 
     let at = row * (DK / 4u) + lane;
     var s = state[at];
+    var s1: vec4<f32>;
+    if PAIRED {
+        s1 = state[at + DK / 4u];
+    }
     for (var p = batch[4]; p < end; p++) {
         var journal_slot = p & (shape.journal_slots - 1u);
         if !MASK_SLOTS {
@@ -78,11 +89,16 @@ fn main(
             scales.y = delta_norm_scale(raw_k, shape.eps);
         }
         let k = raw_k * scales.y;
-        let v = journal_word(base, value_at);
+        let values = journal[base + value_at / 4u];
+        let index = value_at % 4u;
         let decay = journal_word(base, decay_at);
         let b = journal_word(base, beta_at);
-        let delta = (v - decay * subgroupAdd(dot(s, k))) * b;
-        s = s * decay + k * delta;
+        s = update(s, k, values[index], decay, b);
+        if PAIRED {
+            // The value head width is a multiple of 32. Both rows share
+            // the head and their values occupy the same journal vector.
+            s1 = update(s1, k, values[index + 1u], decay, b);
+        }
         if p >= pos0 {
             let raw_q = journal[base + query_at];
             if shape.prepared_norms == 0u {
@@ -90,12 +106,23 @@ fn main(
             }
             let q = raw_q * scales.x * q_scale;
             let o = subgroupAdd(dot(s, q));
+            var o1: f32;
+            if PAIRED {
+                o1 = subgroupAdd(dot(s1, q));
+            }
             if lane == 0u {
-                out[(p - pos0) * value_dim + row] = o;
+                let out_at = (p - pos0) * value_dim + row;
+                out[out_at] = o;
+                if PAIRED {
+                    out[out_at + 1u] = o1;
+                }
             }
         }
     }
     if batch[5] != 0u {
         state[at] = s;
+        if PAIRED {
+            state[at + DK / 4u] = s1;
+        }
     }
 }

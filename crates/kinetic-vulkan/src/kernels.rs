@@ -62,6 +62,7 @@ pub struct Kernels {
     pub(crate) delta_prepare_norms: Rc<Kernel>,
     pub(crate) delta_rule: Rc<Kernel>,
     pub(crate) delta_rule_masked: Rc<Kernel>,
+    pub(crate) delta_rule_paired: Option<Rc<Kernel>>,
     pub(crate) gated_norm: Rc<Kernel>,
     pub(crate) attend_64: Rc<Kernel>,
     pub(crate) attend_128: Rc<Kernel>,
@@ -198,6 +199,17 @@ impl Kernels {
                 4,
                 9,
             )?,
+            delta_rule_paired: matrix
+                .then(|| {
+                    Kernel::new(
+                        device,
+                        "delta_rule_paired",
+                        spirv!("delta_rule_paired"),
+                        4,
+                        9,
+                    )
+                })
+                .transpose()?,
             gated_norm: Kernel::new(device, "gated_norm", spirv!("gated_norm"), 7, 5)?,
             attend_64: attend("attend_64", spirv!("attend_64"))?,
             attend_128: attend("attend_128", spirv!("attend_128"))?,
