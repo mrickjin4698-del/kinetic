@@ -51,6 +51,8 @@ pub struct Kernels {
     #[cfg(not(metal_driver))]
     pub(crate) mm: Vec<(TensorType, [Rc<Kernel>; 3])>,
     #[cfg(not(metal_driver))]
+    pub(crate) mm_q8_0_packed_narrow: Option<Rc<Kernel>>,
+    #[cfg(not(metal_driver))]
     pub(crate) mm_pack: Option<Rc<Kernel>>,
     pub(crate) quantize_q8: Rc<Kernel>,
     pub(crate) norm: Rc<Kernel>,
@@ -173,6 +175,10 @@ impl Kernels {
                     .collect::<Result<_>>()?,
                 false => Vec::new(),
             },
+            #[cfg(not(metal_driver))]
+            mm_q8_0_packed_narrow: matrix
+                .then(|| gemv("mm_q8_0_packed_narrow", spirv!("mm_q8_0_packed_narrow")))
+                .transpose()?,
             #[cfg(not(metal_driver))]
             mm_pack: matrix
                 .then(|| Kernel::new(device, "mm_pack", spirv!("mm_pack"), 5, 1))

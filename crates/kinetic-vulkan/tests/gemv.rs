@@ -465,6 +465,9 @@ fn check_matrix_pass(
 fn q8_0_matrix_pass_matches_reference() {
     check_matrix_pass(TensorType::Q8_0, 37, 2 * 256, 32, 21, false);
     check_matrix_pass(TensorType::Q8_0, 128, 3 * 256, 160, 130, false);
+    // The packed narrow pass has partial weight and token tiles and must
+    // match the wider unpacked pass, including tokens scaled to fit f16.
+    check_matrix_pass(TensorType::Q8_0, 29, 3 * 256, 160, 130, true);
 }
 
 /// Inputs past f16's range are scaled into it, not turned to infinity.

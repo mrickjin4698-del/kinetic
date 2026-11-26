@@ -10,7 +10,7 @@ use crate::kernels::{Kernels, MAX_GROUPS};
 use crate::layout::device_layout;
 use crate::matrix_scratch::MatrixScratch;
 #[cfg(not(metal_driver))]
-use crate::matrix_tile::{MATRIX_TILE, MATRIX_WIDE_TILE};
+use crate::matrix_tile::{MATRIX_NARROW_TILE, MATRIX_TILE, MATRIX_WIDE_TILE};
 use crate::memory::{Allocation, DeviceBuffer};
 use crate::pipeline::Kernel;
 
@@ -411,15 +411,23 @@ impl Kernels {
             if let Some(kernels) = self.matrix_kernels(w.ty) {
                 let capacity = batch.rows();
                 let (kernel, tile, input) = match prepared {
-                    Some(scratch) => (
-                        &kernels[2],
-                        MATRIX_WIDE_TILE,
-                        [
-                            x.x.allocation(),
-                            scratch.values.allocation(),
-                            scratch.scales.allocation(),
-                        ],
-                    ),
+                    Some(scratch) => {
+                        let (kernel, tile) = match &self.mm_q8_0_packed_narrow {
+                            Some(narrow) if w.ty == TensorType::Q8_0 && w.rows <= 32 => {
+                                (narrow, MATRIX_NARROW_TILE)
+                            }
+                            _ => (&kernels[2], MATRIX_WIDE_TILE),
+                        };
+                        (
+                            kernel,
+                            tile,
+                            [
+                                x.x.allocation(),
+                                scratch.values.allocation(),
+                                scratch.scales.allocation(),
+                            ],
+                        )
+                    }
                     None if capacity > MATRIX_TILE.1 => {
                         (&kernels[1], MATRIX_WIDE_TILE, x.outputs())
                     }

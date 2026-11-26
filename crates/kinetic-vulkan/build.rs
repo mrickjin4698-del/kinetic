@@ -154,11 +154,16 @@ fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"));
     for &(name, constants, parts) in MATRIX_KERNELS {
         let source = vulkan_weight_source(constants, parts);
+        let narrow = (name == "mm_q8_0")
+            .then(|| (format!("{name}_packed_narrow"), MATRIX_NARROW_TILE, true));
         for (kernel, (rows, tokens), packed) in [
             (name.to_owned(), MATRIX_TILE, false),
             (format!("{name}_wide"), MATRIX_WIDE_TILE, false),
             (format!("{name}_packed"), MATRIX_WIDE_TILE, true),
-        ] {
+        ]
+        .into_iter()
+        .chain(narrow)
+        {
             // after the parts, whose `enable` directives come first
             let source = format!(
                 "{source}\nconst TILE_ROWS: u32 = {rows}u;\nconst TILE_TOKENS: u32 = {tokens}u;\nconst PACKED: bool = {packed};\n"

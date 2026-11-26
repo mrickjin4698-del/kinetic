@@ -7,9 +7,9 @@ enable wgpu_cooperative_matrix;
 //
 // Y = W X for a pass of many tokens, on the matrix units of devices with
 // cooperative 16x16x16 f16 products into f32. A workgroup of four
-// subgroups takes 64 or 128 rows of W by 64 tokens. Each step stages 32
-// columns of weights and inputs as f16. A subgroup multiplies a 32-row
-// region of the tile as products of 16.
+// subgroups takes 64 or 128 rows of W by 64 tokens. Narrow projections
+// use one subgroup for 16 weight rows by 16 tokens. Each step stages 32
+// columns of weights and inputs as f16.
 // The sums are f32, of f16 terms: close
 // to the int8 GEMV's, not equal, and each token's outputs depend only on
 // that token, so how a prompt is cut changes no bit.
@@ -44,10 +44,11 @@ var<immediate> shape: Shape;
 @group(0) @binding(5) var<storage, read> batch: array<u32>;
 
 // The wide tile puts all four subgroups along the row dimension.
-const_assert TILE_TOKENS == 64u;
-const_assert (TILE_ROWS == 64u || TILE_ROWS == 128u);
+const NARROW: bool = TILE_ROWS == 16u;
 const WIDE: bool = TILE_ROWS == 128u;
-const THREADS: u32 = 128u;
+const_assert (((TILE_ROWS == 64u || WIDE) && TILE_TOKENS == 64u)
+    || (NARROW && PACKED && TILE_TOKENS == 16u));
+const THREADS: u32 = select(128u, 32u, NARROW);
 const WEIGHT_LANES: u32 = THREADS / TILE_ROWS;
 const INPUT_LANES: u32 = THREADS / TILE_TOKENS;
 const INPUT_VECTORS: u32 = 8u / INPUT_LANES;
@@ -90,7 +91,7 @@ fn write_tile(row0: u32, tok0: u32, first: u32, count: u32, tid: u32) {
     }
 }
 
-@compute @workgroup_size(128)
+@compute @workgroup_size(THREADS)
 fn main(
     @builtin(workgroup_id) group: vec3<u32>,
     @builtin(local_invocation_index) tid: u32,
@@ -180,6 +181,12 @@ fn main(
         }
         workgroupBarrier();
         for (var kk = 0u; kk < 8u; kk += 4u) {
+            if NARROW {
+                let a = coopLoadT<coop_mat16x16<f16, A>>(&wa[kk], LD);
+                let b = coopLoad<coop_mat16x16<f16, B>>(&xb[kk], LD);
+                c00 = coopMultiplyAdd(a, b, c00);
+                continue;
+            }
             let a0 = coopLoadT<coop_mat16x16<f16, A>>(&wa[qr * LD + kk], LD);
             let a1 = coopLoadT<coop_mat16x16<f16, A>>(&wa[(qr + 16u) * LD + kk], LD);
             let b0 = coopLoad<coop_mat16x16<f16, B>>(&xb[qt * LD + kk], LD);
@@ -201,13 +208,15 @@ fn main(
     }
 
     // out[token][row]: column-major stores of the row-by-token products
-    let left = qt * OUT_STRIDE + qr;
-    let right = left + 16u * OUT_STRIDE;
+    let left = select(qt * OUT_STRIDE + qr, 0u, NARROW);
     coopStore(c00, &out[left], OUT_STRIDE);
-    coopStore(c10, &out[left + 16u], OUT_STRIDE);
-    if OUT_TOKENS == TILE_TOKENS {
-        coopStore(c01, &out[right], OUT_STRIDE);
-        coopStore(c11, &out[right + 16u], OUT_STRIDE);
+    if !NARROW {
+        coopStore(c10, &out[left + 16u], OUT_STRIDE);
+        if OUT_TOKENS == TILE_TOKENS {
+            let right = left + 16u * OUT_STRIDE;
+            coopStore(c01, &out[right], OUT_STRIDE);
+            coopStore(c11, &out[right + 16u], OUT_STRIDE);
+        }
     }
     workgroupBarrier();
     write_tile(row0, tok0, 0u, count, tid);
