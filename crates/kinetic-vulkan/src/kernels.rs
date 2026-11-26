@@ -49,7 +49,7 @@ pub struct Kernels {
     /// Products of prompt passes on the matrix units, on devices with
     /// cooperative f16 matrices (`Features::matrix_f16`).
     #[cfg(not(metal_driver))]
-    pub(crate) mm: Vec<(TensorType, Rc<Kernel>)>,
+    pub(crate) mm: Vec<(TensorType, [Rc<Kernel>; 2])>,
     pub(crate) quantize_q8: Rc<Kernel>,
     pub(crate) norm: Rc<Kernel>,
     pub(crate) swiglu: Rc<Kernel>,
@@ -70,11 +70,31 @@ pub struct Kernels {
 /// The weight types with kernels on the matrix units, and those kernels,
 /// as build.rs compiles them.
 #[cfg(not(metal_driver))]
-const MATRIX_TYPES: [(TensorType, &str, &[u8]); 4] = [
-    (TensorType::Q8_0, "mm_q8_0", spirv!("mm_q8_0")),
-    (TensorType::Q4K, "mm_q4_k", spirv!("mm_q4_k")),
-    (TensorType::Q5K, "mm_q5_k", spirv!("mm_q5_k")),
-    (TensorType::Q6K, "mm_q6_k", spirv!("mm_q6_k")),
+const MATRIX_TYPES: [(TensorType, &str, &[u8], &[u8]); 4] = [
+    (
+        TensorType::Q8_0,
+        "mm_q8_0",
+        spirv!("mm_q8_0"),
+        spirv!("mm_q8_0_wide"),
+    ),
+    (
+        TensorType::Q4K,
+        "mm_q4_k",
+        spirv!("mm_q4_k"),
+        spirv!("mm_q4_k_wide"),
+    ),
+    (
+        TensorType::Q5K,
+        "mm_q5_k",
+        spirv!("mm_q5_k"),
+        spirv!("mm_q5_k_wide"),
+    ),
+    (
+        TensorType::Q6K,
+        "mm_q6_k",
+        spirv!("mm_q6_k"),
+        spirv!("mm_q6_k_wide"),
+    ),
 ];
 
 /// Most tokens of a prompt pass on the matrix units; every state holds
@@ -91,7 +111,7 @@ impl Kernels {
     /// [`Kernels::load`], with prompt passes on the matrix units only if
     /// `matrix` and the device has them; see [`Kernels::matrix`].
     pub fn load_with(device: &Rc<Device>, matrix: bool) -> Result<Kernels> {
-        let gemv = |name, spirv| Kernel::new(device, name, spirv, 6, 5);
+        let gemv = |name: &str, spirv| Kernel::new(device, name, spirv, 6, 5);
         let attend = |name, spirv| Kernel::new(device, name, spirv, 7, 9);
         #[cfg(not(metal_driver))]
         let matrix = matrix && device.info().features.matrix_f16;
@@ -123,7 +143,12 @@ impl Kernels {
             mm: match matrix {
                 true => MATRIX_TYPES
                     .iter()
-                    .map(|&(ty, name, spirv)| Ok((ty, gemv(name, spirv)?)))
+                    .map(|&(ty, name, regular, wide)| {
+                        Ok((
+                            ty,
+                            [gemv(name, regular)?, gemv(&format!("{name}_wide"), wide)?],
+                        ))
+                    })
                     .collect::<Result<_>>()?,
                 false => Vec::new(),
             },

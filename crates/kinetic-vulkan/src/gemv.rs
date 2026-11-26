@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 use crate::kernels::{Kernels, MAX_GROUPS};
 use crate::layout::device_layout;
 #[cfg(not(metal_driver))]
-use crate::matrix_tile::MATRIX_TILE;
+use crate::matrix_tile::{MATRIX_TILE, MATRIX_WIDE_TILE};
 use crate::memory::{Allocation, DeviceBuffer};
 use crate::pipeline::Kernel;
 
@@ -292,9 +292,16 @@ impl Kernels {
         let many = rows == Rows::Tokens && commands.prompt();
         #[cfg(not(metal_driver))]
         if many {
-            if let Some(kernel) = self.matrix_kernel(w.ty) {
+            if let Some(kernels) = self.matrix_kernels(w.ty) {
+                let (kernel, tile) = if capacity > MATRIX_TILE.1 {
+                    (&kernels[1], MATRIX_WIDE_TILE)
+                } else {
+                    (&kernels[0], MATRIX_TILE)
+                };
                 // SAFETY: as below; the kernel takes the same bindings.
-                unsafe { self.record_matrix(kernel, w, x, y, out, capacity, batch, commands) };
+                unsafe {
+                    self.record_matrix(kernel, w, x, y, out, capacity, tile, batch, commands)
+                };
                 return Ok(());
             }
         }
@@ -370,7 +377,7 @@ impl Kernels {
     pub fn exact_prompt(&self, ty: TensorType) -> bool {
         #[cfg(not(metal_driver))]
         {
-            self.matrix_kernel(ty).is_none()
+            self.matrix_kernels(ty).is_none()
         }
         #[cfg(metal_driver)]
         {
@@ -379,18 +386,16 @@ impl Kernels {
         }
     }
 
-    /// The kernel on the matrix units for weights of type `ty`, where the
-    /// device has one.
+    /// Matrix kernels for weights of type `ty` in regular and wide tiles.
     #[cfg(not(metal_driver))]
-    fn matrix_kernel(&self, ty: TensorType) -> Option<&Rc<Kernel>> {
+    fn matrix_kernels(&self, ty: TensorType) -> Option<&[Rc<Kernel>; 2]> {
         self.mm
             .iter()
             .find(|(t, _)| *t == ty)
-            .map(|(_, kernel)| kernel)
+            .map(|(_, kernels)| kernels)
     }
 
-    /// Records a product on the matrix units: tiles of 64 rows by 64 of
-    /// the batch's `capacity` tokens.
+    /// Records a product on the matrix units with the kernel's output tile.
     ///
     /// # Safety
     ///
@@ -405,6 +410,7 @@ impl Kernels {
         y: &DeviceBuffer<f32>,
         out: Out,
         capacity: usize,
+        tile: (usize, usize),
         batch: &Batch,
         commands: &mut Commands,
     ) {
@@ -432,8 +438,8 @@ impl Kernels {
                     0,
                 ],
                 [
-                    w.rows.div_ceil(MATRIX_TILE) as u32,
-                    capacity.max(1).div_ceil(MATRIX_TILE) as u32,
+                    w.rows.div_ceil(tile.0) as u32,
+                    capacity.max(1).div_ceil(tile.1) as u32,
                     1,
                 ],
             )

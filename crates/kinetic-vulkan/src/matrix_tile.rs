@@ -1,4 +1,5 @@
-/// Rows and tokens of a workgroup's tile in the kernels on the matrix
-/// units. build.rs reads this file too and hands it to mm.wgsl as `TILE`,
-/// whose layout (four subgroups of 32 by 32 quarters) is written for 64.
-pub(crate) const MATRIX_TILE: usize = 64;
+/// Output rows and tokens per matrix workgroup. build.rs uses these sizes
+/// for the shader variants, each with four subgroups taking 32 output rows each.
+pub(crate) const MATRIX_TILE: (usize, usize) = (64, 64);
+/// Reuses each token across twice as many weight rows for long passes.
+pub(crate) const MATRIX_WIDE_TILE: (usize, usize) = (128, 64);

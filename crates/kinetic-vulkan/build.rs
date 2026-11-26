@@ -93,14 +93,22 @@ fn main() {
     }
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"));
     for &(name, constants, parts) in MATRIX_KERNELS {
-        // after the parts, whose `enable` directives come first
-        let source = format!(
-            "{}\nconst TILE: u32 = {MATRIX_TILE}u;\n",
-            source(constants, parts, &["shaders"])
-        );
-        let (module, info) = parse_with(name, &source, MATRIX_CAPABILITIES);
-        fs::write(out.join(format!("{name}.spv")), spirv(name, &module, &info))
+        let source = source(constants, parts, &["shaders"]);
+        for (kernel, (rows, tokens)) in [
+            (name.to_owned(), MATRIX_TILE),
+            (format!("{name}_wide"), MATRIX_WIDE_TILE),
+        ] {
+            // after the parts, whose `enable` directives come first
+            let source = format!(
+                "{source}\nconst TILE_ROWS: u32 = {rows}u;\nconst TILE_TOKENS: u32 = {tokens}u;\n"
+            );
+            let (module, info) = parse_with(&kernel, &source, MATRIX_CAPABILITIES);
+            fs::write(
+                out.join(format!("{kernel}.spv")),
+                spirv(&kernel, &module, &info),
+            )
             .expect("write SPIR-V");
+        }
     }
     for &(name, constants, parts) in KERNELS {
         let (module, info) = parse(name, &source(constants, parts, &["shaders"]));

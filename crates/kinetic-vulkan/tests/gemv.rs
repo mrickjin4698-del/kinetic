@@ -439,6 +439,7 @@ fn matrix_passes_take_inputs_past_f16() {
         TensorType::Q6K,
     ] {
         check_matrix_pass(ty, 64, 2 * 256, 64, 40, true);
+        check_matrix_pass(ty, 65, 2 * 256, 160, 100, true);
     }
 }
 
