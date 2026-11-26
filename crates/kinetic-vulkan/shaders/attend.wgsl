@@ -43,6 +43,10 @@ var<workgroup> top: array<f32, HEADS * SUBGROUPS>;
 var<workgroup> total: array<f32, HEADS * SUBGROUPS>;
 var<workgroup> partial: array<f32, HEADS * SUBGROUPS * HD>;
 
+fn next_offset(offset: u32, step: u32, wrap_at: u32) -> u32 {
+    return select(offset + step, offset - wrap_at, offset >= wrap_at);
+}
+
 @compute @workgroup_size(THREADS * HEADS)
 fn main(
     @builtin(workgroup_id) group: vec3<u32>,
@@ -81,7 +85,43 @@ fn main(
     let word_step = cache_step * row_words;
     let wrap_at = (shape.slots - cache_step) * row_words;
     var cache_offset = (first_pos % shape.slots) * row_words;
-    for (var p = first_pos; p < len; p += SUBGROUPS) {
+    var p = first_pos;
+    if HEADS == 2u {
+        // Interleave two reads, then apply the two softmax updates in order.
+        let pair_end = len - min(len, SUBGROUPS);
+        for (; p < pair_end; p += 2u * SUBGROUPS) {
+            let offset1 = next_offset(cache_offset, word_step, wrap_at);
+            let row0 = cache_offset + first;
+            let row1 = offset1 + first;
+            var qk0 = 0.0;
+            var qk1 = 0.0;
+            for (var k = 0u; k < PAIRS; k++) {
+                let pair = 32u * k;
+                qk0 += dot(q[k], unpack2x16float(kc[row0 + pair]));
+                qk1 += dot(q[k], unpack2x16float(kc[row1 + pair]));
+            }
+            let s0 = subgroupAdd(qk0);
+            let s1 = subgroupAdd(qk1);
+            let next0 = max(m, s0);
+            let next1 = max(next0, s1);
+            let c0 = exp(m - next0);
+            let e0 = exp(s0 - next0);
+            let c1 = exp(next0 - next1);
+            let e1 = exp(s1 - next1);
+            l = l * c0 + e0;
+            l = l * c1 + e1;
+            for (var k = 0u; k < PAIRS; k++) {
+                let pair = 32u * k;
+                let v0 = unpack2x16float(vc[row0 + pair]);
+                let v1 = unpack2x16float(vc[row1 + pair]);
+                acc[k] = acc[k] * c0 + e0 * v0;
+                acc[k] = acc[k] * c1 + e1 * v1;
+            }
+            m = next1;
+            cache_offset = next_offset(offset1, word_step, wrap_at);
+        }
+    }
+    for (; p < len; p += SUBGROUPS) {
         let row = cache_offset + first;
         var qk = 0.0;
         for (var k = 0u; k < PAIRS; k++) {
@@ -96,7 +136,7 @@ fn main(
             acc[k] = acc[k] * c + e * unpack2x16float(vc[row + 32u * k]);
         }
         m = next;
-        cache_offset = select(cache_offset + word_step, cache_offset - wrap_at, cache_offset >= wrap_at);
+        cache_offset = next_offset(cache_offset, word_step, wrap_at);
     }
     if lane == 0u {
         top[part + slot] = m;
