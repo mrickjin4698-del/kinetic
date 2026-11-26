@@ -218,11 +218,19 @@ impl Sampler {
 
         let c = &mut self.candidates;
         c.clear();
-        c.extend(
-            (0u32..)
-                .zip(logits.iter().copied())
-                .filter(|x| x.1 > f32::NEG_INFINITY),
-        );
+        if logits.len() >= 4096
+            && (1..=64).contains(&p.top_k)
+            && p.mirostat == 0
+            && p.top_n_sigma <= 0.0
+        {
+            collect_top_candidates(c, logits, p.top_k);
+        } else {
+            c.extend(
+                (0u32..)
+                    .zip(logits.iter().copied())
+                    .filter(|x| x.1 > f32::NEG_INFINITY),
+            );
+        }
         if c.is_empty() {
             return argmax(logits);
         }
@@ -268,6 +276,31 @@ impl Sampler {
         softmax(c, p.temperature);
         c[draw(c, self.rng.next_f32())].0
     }
+}
+
+/// Keep the best candidates and a small batch of potential replacements.
+fn collect_top_candidates(c: &mut Vec<(u32, f32)>, logits: &[f32], top_k: usize) {
+    const BATCH: u32 = 256;
+    let mut cutoff = f32::NEG_INFINITY;
+    let mut last_partition = None;
+    let mut remaining = (0u32..).zip(logits.iter().copied());
+    for (id, logit) in remaining.by_ref() {
+        // A later token loses a tie. total_cmp also distinguishes signed zeros.
+        if logit.total_cmp(&cutoff).is_gt() && logit > f32::NEG_INFINITY {
+            c.push((id, logit));
+            if c.len() == top_k + BATCH as usize {
+                let (_, kth, _) = c.select_nth_unstable_by(top_k - 1, by_logit);
+                cutoff = kth.1;
+                c.truncate(top_k);
+                // With many rising logits, one partition of the remainder is cheaper.
+                if last_partition.is_some_and(|previous| id - previous <= 2 * BATCH) {
+                    break;
+                }
+                last_partition = Some(id);
+            }
+        }
+    }
+    c.extend(remaining.filter(|x| x.1 > f32::NEG_INFINITY));
 }
 
 /// Highest logit first, ties to the lower token.
@@ -367,6 +400,38 @@ mod tests {
             ..Sampling::default()
         });
         assert_eq!(s.sample(&[0.1, 2.0, 1.0], &[]), 1);
+    }
+
+    #[test]
+    fn bounded_top_candidates_match_full_sort() {
+        let increasing: Vec<_> = (0..8192).map(|i| i as f32).collect();
+        let ties: Vec<_> = (0..8192)
+            .map(|i| match i {
+                0 => f32::NAN,
+                1 => f32::NEG_INFINITY,
+                8000 | 8001 => f32::INFINITY,
+                2..4096 => -0.0,
+                _ => 0.0,
+            })
+            .collect();
+        for logits in [increasing, ties] {
+            let mut all: Vec<_> = (0u32..)
+                .zip(logits.iter().copied())
+                .filter(|x| x.1 > f32::NEG_INFINITY)
+                .collect();
+            all.sort_unstable_by(by_logit);
+            for top_k in [1, 40, 64] {
+                let mut candidates = Vec::new();
+                collect_top_candidates(&mut candidates, &logits, top_k);
+                candidates.sort_unstable_by(by_logit);
+                candidates.truncate(top_k);
+                let bits = |(id, logit): &(u32, f32)| (*id, logit.to_bits());
+                assert!(candidates
+                    .iter()
+                    .map(bits)
+                    .eq(all[..top_k].iter().map(bits)));
+            }
+        }
     }
 
     #[test]
