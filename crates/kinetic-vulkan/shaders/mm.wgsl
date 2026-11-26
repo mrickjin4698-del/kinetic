@@ -38,7 +38,7 @@ var<immediate> shape: Shape;
 
 @group(0) @binding(0) var<storage, read> w: array<vec4<u32>>;
 @group(0) @binding(1) var<storage, read> x: array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read> xq: array<vec4<u32>>;
+@group(0) @binding(2) var<storage, read> xp: array<vec4<f16>>;
 @group(0) @binding(3) var<storage, read> xd: array<vec2<f32>>;
 @group(0) @binding(4) var<storage, read_write> y: array<f32>;
 @group(0) @binding(5) var<storage, read> batch: array<u32>;
@@ -70,8 +70,6 @@ var<workgroup> span: vec4<u32>;
 var<workgroup> peak: array<f32, THREADS>;
 var<workgroup> scale: array<f32, TILE_TOKENS>;
 
-// Inputs above this get scaled down.
-const SAFE: f32 = 32768.0;
 
 // Element `i` of the f16 plane that starts at word `base`.
 fn f16_at(base: u32, i: u32) -> f32 {
@@ -125,20 +123,24 @@ fn main(
     let xh = tid % INPUT_LANES;
     let xrow = start + min(tok0 + xr, count - 1u);
 
-    // the token's power of two, from the largest of its block scales
-    var big = 0.0;
-    for (var b = xh; b < steps; b += INPUT_LANES) {
-        big = max(big, xd[xrow * steps + b].x);
-    }
-    peak[tid] = big * 127.0;
-    workgroupBarrier();
-    let top = max(peak[xr * 2u], peak[xr * 2u + 1u]);
     var sx = 1.0;
-    if top > SAFE {
-        sx = ldexp(1.0, -i32(ceil(log2(top / SAFE))));
-    }
-    if xh == 0u {
-        scale[xr] = 1.0 / sx;
+    if PACKED {
+        if xh == 0u {
+            scale[xr] = xd[xrow].x;
+        }
+    } else {
+        // Get the token's power of two from the largest of its block scales.
+        var big = 0.0;
+        for (var b = xh; b < steps; b += INPUT_LANES) {
+            big = max(big, xd[xrow * steps + b].x);
+        }
+        peak[tid] = big * 127.0;
+        workgroupBarrier();
+        let top = max(peak[xr * 2u], peak[xr * 2u + 1u]);
+        sx = matrix_input_scale(top);
+        if xh == 0u {
+            scale[xr] = 1.0 / sx;
+        }
     }
 
     let token_quarters = select(2u, 1u, WIDE);
@@ -160,10 +162,17 @@ fn main(
         if WEIGHT_LANES == 1u {
             stage(total, blk, sub, 1u, wr * LD + 4u);
         }
-        let xi = xrow * steps * 8u + ks * 8u + xh * INPUT_VECTORS;
         let at = xr * LD + xh * INPUT_VECTORS;
-        for (var j = 0u; j < INPUT_VECTORS; j++) {
-            xb[at + j] = vec4<f16>(x[xi + j] * sx);
+        if PACKED {
+            let xi = (ks * count + xrow) * 8u + xh * INPUT_VECTORS;
+            for (var j = 0u; j < INPUT_VECTORS; j++) {
+                xb[at + j] = xp[xi + j];
+            }
+        } else {
+            let xi = (xrow * steps + ks) * 8u + xh * INPUT_VECTORS;
+            for (var j = 0u; j < INPUT_VECTORS; j++) {
+                xb[at + j] = vec4<f16>(x[xi + j] * sx);
+            }
         }
         workgroupBarrier();
         for (var kk = 0u; kk < 8u; kk += 4u) {

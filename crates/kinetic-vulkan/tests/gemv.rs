@@ -8,7 +8,7 @@ use half::f16;
 use kinetic_quant::{dequantize, Matrix, TensorType};
 use kinetic_vulkan::{
     AttentionGate, AttentionShape, Batch, Commands, Device, DeviceBuffer, DeviceMatrix, Error,
-    GemvInput, Instance, Kernels, KvCache, Out, QkvConsts, Rows,
+    GemvInput, Instance, Kernels, KvCache, MatrixScratch, Out, QkvConsts, Rows,
 };
 
 struct Gpu {
@@ -385,6 +385,43 @@ fn check_matrix_pass(
             .unwrap();
         commands.submit().unwrap();
         let y = y.to_vec().unwrap();
+
+        if held > 64 {
+            let scratch = MatrixScratch::new(&gpu.device, cols, held).unwrap();
+            let offsets = [3, rows + 6];
+            let stride = 2 * rows + 10;
+            let grouped =
+                DeviceBuffer::from_slice(&gpu.device, &vec![-7.5f32; held * stride]).unwrap();
+            let mut commands = Commands::new(&gpu.device).unwrap();
+            commands.set_prompt(true);
+            batch.record_upload(&mut commands).unwrap();
+            gpu.kernels
+                .gemv_projections(
+                    &offsets.map(|at| (&w, at)),
+                    &input,
+                    &grouped,
+                    stride,
+                    &batch,
+                    Some(&scratch),
+                    &mut commands,
+                )
+                .unwrap();
+            commands.submit().unwrap();
+            let grouped = grouped.to_vec().unwrap();
+            for (t, row) in grouped.chunks_exact(stride).enumerate() {
+                for (i, value) in row.iter().enumerate() {
+                    let expected = offsets
+                        .into_iter()
+                        .find(|&at| (at..at + rows).contains(&i) && t < tokens)
+                        .map_or(-7.5, |at| y[t * out.stride + out.offset + i - at]);
+                    assert_eq!(
+                        value.to_bits(),
+                        expected.to_bits(),
+                        "{name}: packed {ty} token {t} slot {i}"
+                    );
+                }
+            }
+        }
 
         let mut worst = 0.0f64;
         let mut row = vec![0.0; cols];

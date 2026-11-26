@@ -8,6 +8,7 @@ use crate::device::Device;
 use crate::error::{Error, Result};
 use crate::kernels::{Kernels, MAX_GROUPS};
 use crate::layout::device_layout;
+use crate::matrix_scratch::MatrixScratch;
 #[cfg(not(metal_driver))]
 use crate::matrix_tile::{MATRIX_TILE, MATRIX_WIDE_TILE};
 use crate::memory::{Allocation, DeviceBuffer};
@@ -269,13 +270,111 @@ impl Kernels {
             Rows::Tokens => batch.rows(),
             Rows::Head => batch.head_rows(),
         };
+        Self::check_projection(w, x, y, out, capacity, batch)?;
+        self.record_rows(w, x, y, out, rows, batch, None, commands)
+    }
+
+    /// Records projections of the token rows of `x` into disjoint slices
+    /// of each output row. With scratch, long matrix passes pack `x` once
+    /// for all the projections that run on the matrix units.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_projections(
+        &self,
+        projections: &[(&DeviceMatrix, usize)],
+        x: &GemvInput,
+        y: &DeviceBuffer<f32>,
+        stride: usize,
+        batch: &Batch,
+        scratch: Option<&MatrixScratch>,
+        commands: &mut Commands,
+    ) -> Result<()> {
+        if projections.is_empty() {
+            return Ok(());
+        }
+        let capacity = batch.rows();
+        for (i, &(w, offset)) in projections.iter().enumerate() {
+            Self::check_projection(w, x, y, Out { stride, offset }, capacity, batch)?;
+            let end = offset + w.rows;
+            if projections[i + 1..]
+                .iter()
+                .any(|&(other, at)| at < end && offset < at.saturating_add(other.rows))
+            {
+                return Err(Error::Shape("overlapping projection outputs".into()));
+            }
+        }
+
+        #[cfg(not(metal_driver))]
+        let prepared = match (&self.mm_pack, scratch) {
+            (Some(kernel), Some(scratch))
+                if commands.prompt()
+                    && capacity > MATRIX_TILE.1
+                    && capacity <= MAX_GROUPS as usize
+                    && capacity * (x.width() / 2) <= scratch.values.len()
+                    && 2 * capacity <= scratch.scales.len()
+                    && projections
+                        .iter()
+                        .any(|(w, _)| self.matrix_kernels(w.ty).is_some()) =>
+            {
+                // SAFETY: x holds all rows in this batch and scratch holds
+                // their half-precision values plus two scale words per row.
+                // mm_pack reads the batch count and stops beyond it.
+                unsafe {
+                    commands.dispatch(
+                        kernel,
+                        &[
+                            batch.device().allocation(),
+                            x.x.allocation(),
+                            x.ds.allocation(),
+                            scratch.values.allocation(),
+                            scratch.scales.allocation(),
+                        ],
+                        &[(x.width() / 32) as u32],
+                        [capacity as u32, 1, 1],
+                    )
+                };
+                Some(scratch)
+            }
+            _ => None,
+        };
+        #[cfg(metal_driver)]
+        let prepared = {
+            let _ = scratch;
+            None
+        };
+
+        commands.independent(|commands| {
+            for &(w, offset) in projections {
+                self.record_rows(
+                    w,
+                    x,
+                    y,
+                    Out { stride, offset },
+                    Rows::Tokens,
+                    batch,
+                    prepared,
+                    commands,
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    fn check_projection(
+        w: &DeviceMatrix,
+        x: &GemvInput,
+        y: &DeviceBuffer<f32>,
+        out: Out,
+        capacity: usize,
+        batch: &Batch,
+    ) -> Result<()> {
+        let end = out.offset.checked_add(w.rows);
         let needed = (capacity.max(1) - 1)
             .checked_mul(out.stride)
-            .and_then(|end| end.checked_add(out.offset + w.rows));
+            .and_then(|start| end.and_then(|end| start.checked_add(end)));
         if x.width() != w.cols
             || x.rows() < batch.rows()
             || needed.is_none_or(|n| n > y.len() || u32::try_from(n).is_err())
-            || (capacity > 1 && out.stride < out.offset + w.rows)
+            || (capacity > 1 && end.is_some_and(|end| out.stride < end))
         {
             return Err(Error::Shape(format!(
                 "GEMV of a {}x{} matrix on {} rows of {} into {} outputs at stride {} offset {}",
@@ -288,19 +387,48 @@ impl Kernels {
                 out.offset
             )));
         }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_rows(
+        &self,
+        w: &DeviceMatrix,
+        x: &GemvInput,
+        y: &DeviceBuffer<f32>,
+        out: Out,
+        rows: Rows,
+        batch: &Batch,
+        prepared: Option<&MatrixScratch>,
+        commands: &mut Commands,
+    ) -> Result<()> {
         // A pass of many prompt tokens runs every row of the batch.
         let many = rows == Rows::Tokens && commands.prompt();
+        #[cfg(metal_driver)]
+        let _ = prepared;
         #[cfg(not(metal_driver))]
         if many {
             if let Some(kernels) = self.matrix_kernels(w.ty) {
-                let (kernel, tile) = if capacity > MATRIX_TILE.1 {
-                    (&kernels[1], MATRIX_WIDE_TILE)
-                } else {
-                    (&kernels[0], MATRIX_TILE)
+                let capacity = batch.rows();
+                let (kernel, tile, input) = match prepared {
+                    Some(scratch) => (
+                        &kernels[2],
+                        MATRIX_WIDE_TILE,
+                        [
+                            x.x.allocation(),
+                            scratch.values.allocation(),
+                            scratch.scales.allocation(),
+                        ],
+                    ),
+                    None if capacity > MATRIX_TILE.1 => {
+                        (&kernels[1], MATRIX_WIDE_TILE, x.outputs())
+                    }
+                    None => (&kernels[0], MATRIX_TILE, x.outputs()),
                 };
-                // SAFETY: as below; the kernel takes the same bindings.
+                // SAFETY: as below, with f16 blocks and per-token scales when
+                // prepare wrote them, and the original input buffers otherwise.
                 unsafe {
-                    self.record_matrix(kernel, w, x, y, out, capacity, tile, batch, commands)
+                    self.record_matrix(kernel, w, input, y, out, capacity, tile, batch, commands)
                 };
                 return Ok(());
             }
@@ -386,9 +514,9 @@ impl Kernels {
         }
     }
 
-    /// Matrix kernels for weights of type `ty` in regular and wide tiles.
+    /// Matrix kernels for regular, wide and wide packed-input tiles of type `ty`.
     #[cfg(not(metal_driver))]
-    fn matrix_kernels(&self, ty: TensorType) -> Option<&[Rc<Kernel>; 2]> {
+    fn matrix_kernels(&self, ty: TensorType) -> Option<&[Rc<Kernel>; 3]> {
         self.mm
             .iter()
             .find(|(t, _)| *t == ty)
@@ -406,7 +534,7 @@ impl Kernels {
         &self,
         kernel: &Rc<Kernel>,
         w: &DeviceMatrix,
-        x: &GemvInput,
+        input: [&Rc<Allocation>; 3],
         y: &DeviceBuffer<f32>,
         out: Out,
         capacity: usize,
@@ -424,9 +552,9 @@ impl Kernels {
                 kernel,
                 &[
                     w.data.allocation(),
-                    x.x.allocation(),
-                    x.qs.allocation(),
-                    x.ds.allocation(),
+                    input[0],
+                    input[1],
+                    input[2],
                     y.allocation(),
                     batch.device().allocation(),
                 ],

@@ -52,6 +52,7 @@ mod gemv;
 mod info;
 mod kernels;
 mod layout;
+mod matrix_scratch;
 #[cfg(not(metal_driver))]
 mod matrix_tile;
 mod norm;
@@ -107,6 +108,7 @@ pub use gemv::{DeviceMatrix, GemvInput, Out, Rows};
 pub use info::{DeviceInfo, DeviceKind, Features};
 pub use instance::Instance;
 pub use kernels::Kernels;
+pub use matrix_scratch::MatrixScratch;
 pub use memory::{DeviceBuffer, DeviceCopy, HostBuffer};
 pub use norm::Residual;
 pub use physical::PhysicalDevice;

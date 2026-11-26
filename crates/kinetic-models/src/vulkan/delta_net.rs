@@ -1,6 +1,4 @@
-use kinetic_vulkan::{
-    Commands, DeltaShape, DeltaState, DeltaWeights, DeviceBuffer, DeviceMatrix, Out, Rows,
-};
+use kinetic_vulkan::{Commands, DeltaShape, DeltaState, DeltaWeights, DeviceBuffer, DeviceMatrix};
 
 use super::layer::R;
 use super::work::{Needs, Work};
@@ -72,14 +70,7 @@ impl VulkanDeltaNet {
             (&self.beta, channels + vd),
             (&self.alpha, channels + vd + nv),
         ];
-        // The projections write disjoint columns of each row.
-        c.independent(|c| {
-            for (m, offset) in projections {
-                let out = Out { stride, offset };
-                k.gemv_rows(m, &w.h, &w.proj, out, Rows::Tokens, &w.batch, c)?;
-            }
-            Ok(())
-        })?;
+        w.project(k, &w.h, &w.proj, stride, &projections, c)?;
         let weights = DeltaWeights {
             conv: &self.conv,
             heads: &self.heads,
@@ -87,11 +78,7 @@ impl VulkanDeltaNet {
         };
         let mixed = w.mixed(vd);
         k.delta_net(&w.batch, s, &w.proj, &weights, state, &w.rec, mixed, c)?;
-        let out = Out {
-            stride: w.d,
-            offset: 0,
-        };
-        k.gemv_rows(&self.out, mixed, &w.y, out, Rows::Tokens, &w.batch, c)
+        w.project(k, mixed, &w.y, w.d, &[(&self.out, 0)], c)
     }
 
     /// Records the replay a rollback runs.

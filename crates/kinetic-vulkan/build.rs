@@ -49,10 +49,10 @@ const KERNELS: &[(&str, &str, &[&str])] = &[
 /// Metal, whose simdgroup matrices are 8x8. `MATRIX_TYPES` in
 /// src/kernels.rs says which weight type each is for.
 const MATRIX_KERNELS: &[(&str, &str, &[&str])] = &[
-    ("mm_q8_0", "", &["mm", "mm_q8_0"]),
-    ("mm_q4_k", "", &["mm", "k4", "mm_q4_k"]),
-    ("mm_q5_k", "", &["mm", "k4", "mm_q5_k"]),
-    ("mm_q6_k", "", &["mm", "mm_q6_k"]),
+    ("mm_q8_0", "", &["mm", "mm_scale", "mm_q8_0"]),
+    ("mm_q4_k", "", &["mm", "mm_scale", "k4", "mm_q4_k"]),
+    ("mm_q5_k", "", &["mm", "mm_scale", "k4", "mm_q5_k"]),
+    ("mm_q6_k", "", &["mm", "mm_scale", "mm_q6_k"]),
 ];
 
 /// Kernels that take one part more on Metal, whose GEMV kernels are
@@ -94,13 +94,14 @@ fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"));
     for &(name, constants, parts) in MATRIX_KERNELS {
         let source = source(constants, parts, &["shaders"]);
-        for (kernel, (rows, tokens)) in [
-            (name.to_owned(), MATRIX_TILE),
-            (format!("{name}_wide"), MATRIX_WIDE_TILE),
+        for (kernel, (rows, tokens), packed) in [
+            (name.to_owned(), MATRIX_TILE, false),
+            (format!("{name}_wide"), MATRIX_WIDE_TILE, false),
+            (format!("{name}_packed"), MATRIX_WIDE_TILE, true),
         ] {
             // after the parts, whose `enable` directives come first
             let source = format!(
-                "{source}\nconst TILE_ROWS: u32 = {rows}u;\nconst TILE_TOKENS: u32 = {tokens}u;\n"
+                "{source}\nconst TILE_ROWS: u32 = {rows}u;\nconst TILE_TOKENS: u32 = {tokens}u;\nconst PACKED: bool = {packed};\n"
             );
             let (module, info) = parse_with(&kernel, &source, MATRIX_CAPABILITIES);
             fs::write(
@@ -110,6 +111,9 @@ fn main() {
             .expect("write SPIR-V");
         }
     }
+    let pack = source("", &["mm_pack", "mm_scale"], &["shaders"]);
+    let (module, info) = parse_with("mm_pack", &pack, MATRIX_CAPABILITIES);
+    fs::write(out.join("mm_pack.spv"), spirv("mm_pack", &module, &info)).expect("write SPIR-V");
     for &(name, constants, parts) in KERNELS {
         let (module, info) = parse(name, &source(constants, parts, &["shaders"]));
         fs::write(out.join(format!("{name}.spv")), spirv(name, &module, &info))

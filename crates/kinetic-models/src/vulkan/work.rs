@@ -1,7 +1,9 @@
-use kinetic_vulkan::{Batch, DeviceBuffer, GemvInput, HostBuffer};
+use kinetic_vulkan::{
+    Batch, Commands, DeviceBuffer, DeviceMatrix, GemvInput, HostBuffer, Kernels, MatrixScratch,
+};
 
 use super::layer::VulkanLayer;
-use super::Gpu;
+use super::{Gpu, PROMPT_SHORT};
 
 /// The buffers one sequence runs its passes in.
 pub(super) struct Work {
@@ -34,6 +36,7 @@ pub(super) struct Work {
     /// each followed by the bits of its logit.
     pub hidden: HostBuffer<f32>,
     pub greedy: HostBuffer<u32>,
+    matrix_scratch: Option<MatrixScratch>,
 }
 
 /// What a mixer needs of the work buffers per token: projection values,
@@ -81,6 +84,7 @@ impl Work {
             add_width(&mut mixed, needs.width);
             add_width(&mut ffn, layer.n_ff());
         }
+        let matrix_width = mixed.iter().copied().chain([d, n_ff]).max().unwrap();
         let f32s = |len: usize| DeviceBuffer::<f32>::new(dev, len.max(1));
         let inputs = |widths: Vec<usize>| {
             widths
@@ -105,6 +109,15 @@ impl Work {
             hidden: HostBuffer::new(dev, rows * d)?,
             greedy: HostBuffer::new(dev, 2 * head.max(1))?,
             batch,
+            matrix_scratch: if gpu.kernels.matrix() && rows > PROMPT_SHORT {
+                match MatrixScratch::new(dev, matrix_width, rows) {
+                    Ok(scratch) => Some(scratch),
+                    Err(error) if error.out_of_memory() => None,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            },
         })
     }
 
@@ -114,6 +127,27 @@ impl Work {
 
     pub fn activations(&self, width: usize) -> &GemvInput {
         by_width(&self.ffn, width)
+    }
+
+    /// Records projections that share one activation input.
+    pub fn project(
+        &self,
+        kernels: &Kernels,
+        x: &GemvInput,
+        y: &DeviceBuffer<f32>,
+        stride: usize,
+        projections: &[(&DeviceMatrix, usize)],
+        commands: &mut Commands,
+    ) -> kinetic_vulkan::Result<()> {
+        kernels.gemv_projections(
+            projections,
+            x,
+            y,
+            stride,
+            &self.batch,
+            self.matrix_scratch.as_ref(),
+            commands,
+        )
     }
 
     /// Device bytes held.
@@ -126,6 +160,11 @@ impl Work {
             .map(|i| i.len() * 21 / 4)
             .sum();
         let floats = self.x.len() + self.y.len() + self.proj.len() + self.rec.len() + self.gu.len();
-        4 * (floats + self.logits.len()) + inputs
+        4 * (floats + self.logits.len())
+            + inputs
+            + self
+                .matrix_scratch
+                .as_ref()
+                .map_or(0, MatrixScratch::size_bytes)
     }
 }

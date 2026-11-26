@@ -1,7 +1,6 @@
 use kinetic_quant::Matrix;
 use kinetic_vulkan::{
-    AttentionGate, AttentionShape, Commands, DeviceBuffer, DeviceMatrix, KvCache, Out, QkvConsts,
-    Rows,
+    AttentionGate, AttentionShape, Commands, DeviceBuffer, DeviceMatrix, KvCache, QkvConsts,
 };
 
 use super::layer::{unsupported, R};
@@ -118,20 +117,13 @@ impl VulkanAttention {
         let (k, s) = (&gpu.kernels, &self.shape);
         let stride = s.qkv_len();
         let q_len = s.n_head * s.q_head_len();
-        let projections = [
+        let mut projections = vec![
             (&self.q, 0),
             (&self.k, q_len),
             (&self.v, q_len + s.kv_dim()),
         ];
-        let gates = self.head_gate.iter().map(|g| (g, s.gate_at()));
-        // The projections write disjoint columns of each row.
-        c.independent(|c| {
-            for (m, offset) in projections.into_iter().chain(gates) {
-                let out = Out { stride, offset };
-                k.gemv_rows(m, &w.h, &w.proj, out, Rows::Tokens, &w.batch, c)?;
-            }
-            Ok(())
-        })?;
+        projections.extend(self.head_gate.iter().map(|g| (g, s.gate_at())));
+        w.project(k, &w.h, &w.proj, stride, &projections, c)?;
         let consts = QkvConsts {
             data: &self.consts,
             q_norm: self.q_norm,
@@ -149,10 +141,6 @@ impl VulkanAttention {
             att,
             c,
         )?;
-        let out = Out {
-            stride: w.d,
-            offset: 0,
-        };
-        k.gemv_rows(&self.o, att, &w.y, out, Rows::Tokens, &w.batch, c)
+        w.project(k, att, &w.y, w.d, &[(&self.o, 0)], c)
     }
 }

@@ -1,4 +1,4 @@
-use kinetic_vulkan::{Commands, DeviceMatrix, Out, Rows};
+use kinetic_vulkan::{Commands, DeviceMatrix};
 
 use super::layer::{unsupported, R};
 use super::work::Work;
@@ -33,22 +33,16 @@ impl VulkanFfn {
     pub fn record(&self, gpu: &Gpu, w: &Work, c: &mut Commands) -> R {
         let k = &gpu.kernels;
         let n_ff = self.gate.rows();
-        c.independent(|c| {
-            for (m, offset) in [(&self.gate, 0), (&self.up, n_ff)] {
-                let out = Out {
-                    stride: 2 * n_ff,
-                    offset,
-                };
-                k.gemv_rows(m, &w.h, &w.gu, out, Rows::Tokens, &w.batch, c)?;
-            }
-            Ok(())
-        })?;
+        w.project(
+            k,
+            &w.h,
+            &w.gu,
+            2 * n_ff,
+            &[(&self.gate, 0), (&self.up, n_ff)],
+            c,
+        )?;
         let act = w.activations(n_ff);
         k.swiglu(&w.batch, &w.gu, act, c)?;
-        let out = Out {
-            stride: w.d,
-            offset: 0,
-        };
-        k.gemv_rows(&self.down, act, &w.y, out, Rows::Tokens, &w.batch, c)
+        w.project(k, act, &w.y, w.d, &[(&self.down, 0)], c)
     }
 }

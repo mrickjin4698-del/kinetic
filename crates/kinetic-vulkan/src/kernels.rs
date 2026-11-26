@@ -49,7 +49,9 @@ pub struct Kernels {
     /// Products of prompt passes on the matrix units, on devices with
     /// cooperative f16 matrices (`Features::matrix_f16`).
     #[cfg(not(metal_driver))]
-    pub(crate) mm: Vec<(TensorType, [Rc<Kernel>; 2])>,
+    pub(crate) mm: Vec<(TensorType, [Rc<Kernel>; 3])>,
+    #[cfg(not(metal_driver))]
+    pub(crate) mm_pack: Option<Rc<Kernel>>,
     pub(crate) quantize_q8: Rc<Kernel>,
     pub(crate) norm: Rc<Kernel>,
     pub(crate) swiglu: Rc<Kernel>,
@@ -70,30 +72,42 @@ pub struct Kernels {
 /// The weight types with kernels on the matrix units, and those kernels,
 /// as build.rs compiles them.
 #[cfg(not(metal_driver))]
-const MATRIX_TYPES: [(TensorType, &str, &[u8], &[u8]); 4] = [
+const MATRIX_TYPES: [(TensorType, &str, [&[u8]; 3]); 4] = [
     (
         TensorType::Q8_0,
         "mm_q8_0",
-        spirv!("mm_q8_0"),
-        spirv!("mm_q8_0_wide"),
+        [
+            spirv!("mm_q8_0"),
+            spirv!("mm_q8_0_wide"),
+            spirv!("mm_q8_0_packed"),
+        ],
     ),
     (
         TensorType::Q4K,
         "mm_q4_k",
-        spirv!("mm_q4_k"),
-        spirv!("mm_q4_k_wide"),
+        [
+            spirv!("mm_q4_k"),
+            spirv!("mm_q4_k_wide"),
+            spirv!("mm_q4_k_packed"),
+        ],
     ),
     (
         TensorType::Q5K,
         "mm_q5_k",
-        spirv!("mm_q5_k"),
-        spirv!("mm_q5_k_wide"),
+        [
+            spirv!("mm_q5_k"),
+            spirv!("mm_q5_k_wide"),
+            spirv!("mm_q5_k_packed"),
+        ],
     ),
     (
         TensorType::Q6K,
         "mm_q6_k",
-        spirv!("mm_q6_k"),
-        spirv!("mm_q6_k_wide"),
+        [
+            spirv!("mm_q6_k"),
+            spirv!("mm_q6_k_wide"),
+            spirv!("mm_q6_k_packed"),
+        ],
     ),
 ];
 
@@ -143,15 +157,23 @@ impl Kernels {
             mm: match matrix {
                 true => MATRIX_TYPES
                     .iter()
-                    .map(|&(ty, name, regular, wide)| {
+                    .map(|&(ty, name, [regular, wide, packed])| {
                         Ok((
                             ty,
-                            [gemv(name, regular)?, gemv(&format!("{name}_wide"), wide)?],
+                            [
+                                gemv(name, regular)?,
+                                gemv(&format!("{name}_wide"), wide)?,
+                                gemv(&format!("{name}_packed"), packed)?,
+                            ],
                         ))
                     })
                     .collect::<Result<_>>()?,
                 false => Vec::new(),
             },
+            #[cfg(not(metal_driver))]
+            mm_pack: matrix
+                .then(|| Kernel::new(device, "mm_pack", spirv!("mm_pack"), 5, 1))
+                .transpose()?,
             quantize_q8: Kernel::new(device, "quantize_q8", spirv!("quantize_q8"), 3, 1)?,
             norm: Kernel::new(device, "norm", spirv!("norm"), 8, 4)?,
             swiglu: Kernel::new(device, "swiglu", spirv!("swiglu"), 5, 1)?,
