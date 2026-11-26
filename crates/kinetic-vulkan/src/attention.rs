@@ -238,126 +238,190 @@ impl Kernels {
         out: &GemvInput,
         commands: &mut Commands,
     ) -> Result<()> {
+        self.record_attention(
+            batch,
+            shape,
+            qkv,
+            Some((consts, rope_table)),
+            cache,
+            Some(out),
+            commands,
+        )
+    }
+
+    /// Readies the queries and writes the batch's keys and values to the cache.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_attention(
+        &self,
+        batch: &Batch,
+        shape: &AttentionShape,
+        qkv: &DeviceBuffer<f32>,
+        consts: &QkvConsts,
+        rope_table: usize,
+        cache: &KvCache,
+        commands: &mut Commands,
+    ) -> Result<()> {
+        self.record_attention(
+            batch,
+            shape,
+            qkv,
+            Some((consts, rope_table)),
+            cache,
+            None,
+            commands,
+        )
+    }
+
+    /// Writes the outputs of attention using queries and cache entries from
+    /// prepare_attention for the same batch.
+    pub fn attend_prepared(
+        &self,
+        batch: &Batch,
+        shape: &AttentionShape,
+        qkv: &DeviceBuffer<f32>,
+        cache: &KvCache,
+        out: &GemvInput,
+        commands: &mut Commands,
+    ) -> Result<()> {
+        self.record_attention(batch, shape, qkv, None, cache, Some(out), commands)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_attention(
+        &self,
+        batch: &Batch,
+        shape: &AttentionShape,
+        qkv: &DeviceBuffer<f32>,
+        prepare: Option<(&QkvConsts, usize)>,
+        cache: &KvCache,
+        out: Option<&GemvInput>,
+        commands: &mut Commands,
+    ) -> Result<()> {
         shape.check()?;
         let rows = batch.rows();
         let hd = shape.head_dim;
-        let within =
-            |at: Option<usize>, len: usize| at.is_none_or(|a| a + len <= consts.data.len());
         let fits = qkv.len() >= rows * shape.qkv_len()
             && cache.positions >= batch.positions()
             && cache.rows >= rows
             && cache.size_bytes() == 4 * cache.slots * shape.kv_dim()
-            && out.width() == shape.n_head * hd
-            && out.rows() >= rows
-            && rope_table + rows * shape.rope_dims <= batch.table_words()
-            && within(consts.q_norm, hd)
-            && within(consts.k_norm, hd)
-            && within(consts.bias, shape.qkv_len());
+            && out.is_none_or(|out| out.width() == shape.n_head * hd && out.rows() >= rows)
+            && prepare.is_none_or(|(consts, rope_table)| {
+                let within =
+                    |at: Option<usize>, len: usize| at.is_none_or(|a| a + len <= consts.data.len());
+                rope_table + rows * shape.rope_dims <= batch.table_words()
+                    && within(consts.q_norm, hd)
+                    && within(consts.k_norm, hd)
+                    && within(consts.bias, shape.qkv_len())
+            });
         if !fits {
             return Err(Error::Shape(format!(
                 "attention of {rows} rows of shape {shape:?}"
             )));
         }
-        let flag = |on: bool, bit: u32| if on { bit } else { 0 };
-        let flags = flag(shape.rope_adjacent, 1)
-            | flag(shape.norm_after_rope, 2)
-            | flag(consts.bias.is_some(), 4)
-            | flag(consts.q_norm.is_some(), 8)
-            | flag(consts.k_norm.is_some(), 16);
-        let word = |at: Option<usize>| at.unwrap_or(0) as u32;
-        let gate = match shape.gate {
-            AttentionGate::None => 0,
-            AttentionGate::PerValue => 1,
-            AttentionGate::PerHead => 2,
-        };
         let packed = cache.values.is_none();
-        let (planar, index) = match hd {
-            64 => (&self.attend_64, 0),
-            128 => (&self.attend_128, 1),
-            _ => (&self.attend_256, 2),
-        };
-        let single = if packed {
-            &self
-                .attend_packed
-                .as_ref()
-                .expect("packed Vulkan attention")[index]
-        } else {
-            planar
-        };
-        let grouped = if packed {
-            self.attend_256_packed_grouped.as_ref()
-        } else {
-            self.attend_256_grouped.as_ref()
-        };
-        // Pair consecutive query heads within each KV head.
-        let pair_heads =
-            hd == 256 && commands.prompt() && (shape.n_head / shape.n_head_kv).is_multiple_of(2);
-        let (attend, heads) = grouped
-            .filter(|_| pair_heads)
-            .map_or((single, 1), |k| (k, 2));
         let values = cache.values.as_ref().unwrap_or(&self.single).allocation();
         let batch_words = batch.device().allocation();
-        let [ox, oq, od] = out.outputs();
-        // SAFETY: rope.wgsl takes the batch, qkv, consts and cache buffers
-        // at bindings 0..=4; attend takes the batch, qkv, cache and outputs
-        // at 0..=6. With packed data the separate values binding is unused.
-        // Every index they form stays inside the sizes checked above:
-        // token rows
-        // below the batch's rows, positions below its positions, constants
-        // and table words where the offsets say. Workgroups past the pass's
-        // tokens return early.
-        unsafe {
-            commands.dispatch(
-                &self.rope,
-                &[
-                    batch_words,
-                    qkv.allocation(),
-                    consts.data.allocation(),
-                    cache.data.allocation(),
-                    values,
-                ],
-                &[
-                    shape.n_head as u32,
-                    shape.n_head_kv as u32,
-                    hd as u32,
-                    shape.q_head_len() as u32,
-                    shape.qkv_len() as u32,
-                    shape.rope_dims as u32,
-                    (BATCH_HEADER + rope_table) as u32,
-                    flags,
-                    shape.eps.to_bits(),
-                    word(consts.bias),
-                    word(consts.q_norm),
-                    word(consts.k_norm),
-                    cache.slots as u32,
-                    packed as u32,
-                ],
-                [(shape.n_head + 2 * shape.n_head_kv) as u32, rows as u32, 1],
-            );
-            commands.dispatch(
-                attend,
-                &[
-                    batch_words,
-                    qkv.allocation(),
-                    cache.data.allocation(),
-                    values,
-                    ox,
-                    oq,
-                    od,
-                ],
-                &[
-                    shape.n_head as u32,
-                    shape.n_head_kv as u32,
-                    shape.qkv_len() as u32,
-                    shape.q_head_len() as u32,
-                    shape.scale.to_bits(),
-                    gate,
-                    shape.gate_at() as u32,
-                    shape.window.map_or(u32::MAX, |w| w as u32),
-                    cache.slots as u32,
-                ],
-                [(shape.n_head / heads) as u32, rows as u32, 1],
-            );
+        if let Some((consts, rope_table)) = prepare {
+            let flag = |on: bool, bit: u32| if on { bit } else { 0 };
+            let flags = flag(shape.rope_adjacent, 1)
+                | flag(shape.norm_after_rope, 2)
+                | flag(consts.bias.is_some(), 4)
+                | flag(consts.q_norm.is_some(), 8)
+                | flag(consts.k_norm.is_some(), 16);
+            let word = |at: Option<usize>| at.unwrap_or(0) as u32;
+            // SAFETY: matches rope.wgsl. The token rows, constants, tables,
+            // and cache slots all fit the checked buffers. The shader skips
+            // the separate values binding for a packed cache.
+            unsafe {
+                commands.dispatch(
+                    &self.rope,
+                    &[
+                        batch_words,
+                        qkv.allocation(),
+                        consts.data.allocation(),
+                        cache.data.allocation(),
+                        values,
+                    ],
+                    &[
+                        shape.n_head as u32,
+                        shape.n_head_kv as u32,
+                        hd as u32,
+                        shape.q_head_len() as u32,
+                        shape.qkv_len() as u32,
+                        shape.rope_dims as u32,
+                        (BATCH_HEADER + rope_table) as u32,
+                        flags,
+                        shape.eps.to_bits(),
+                        word(consts.bias),
+                        word(consts.q_norm),
+                        word(consts.k_norm),
+                        cache.slots as u32,
+                        packed as u32,
+                    ],
+                    [(shape.n_head + 2 * shape.n_head_kv) as u32, rows as u32, 1],
+                )
+            };
+        }
+        if let Some(out) = out {
+            let gate = match shape.gate {
+                AttentionGate::None => 0,
+                AttentionGate::PerValue => 1,
+                AttentionGate::PerHead => 2,
+            };
+            let (planar, index) = match hd {
+                64 => (&self.attend_64, 0),
+                128 => (&self.attend_128, 1),
+                _ => (&self.attend_256, 2),
+            };
+            let single = if packed {
+                &self
+                    .attend_packed
+                    .as_ref()
+                    .expect("packed Vulkan attention")[index]
+            } else {
+                planar
+            };
+            let grouped = if packed {
+                self.attend_256_packed_grouped.as_ref()
+            } else {
+                self.attend_256_grouped.as_ref()
+            };
+            // Pair consecutive query heads within each KV head.
+            let pair_heads = hd == 256
+                && commands.prompt()
+                && (shape.n_head / shape.n_head_kv).is_multiple_of(2);
+            let (attend, heads) = grouped
+                .filter(|_| pair_heads)
+                .map_or((single, 1), |k| (k, 2));
+            let [ox, oq, od] = out.outputs();
+            // SAFETY: matches attend.wgsl. The batch reads from the checked
+            // cache and writes each head into its checked output row.
+            unsafe {
+                commands.dispatch(
+                    attend,
+                    &[
+                        batch_words,
+                        qkv.allocation(),
+                        cache.data.allocation(),
+                        values,
+                        ox,
+                        oq,
+                        od,
+                    ],
+                    &[
+                        shape.n_head as u32,
+                        shape.n_head_kv as u32,
+                        shape.qkv_len() as u32,
+                        shape.q_head_len() as u32,
+                        shape.scale.to_bits(),
+                        gate,
+                        shape.gate_at() as u32,
+                        shape.window.map_or(u32::MAX, |w| w as u32),
+                        cache.slots as u32,
+                    ],
+                    [(shape.n_head / heads) as u32, rows as u32, 1],
+                )
+            };
         }
         Ok(())
     }

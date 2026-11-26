@@ -112,8 +112,8 @@ impl VulkanAttention {
         }
     }
 
-    /// Reads `w.h` and leaves the projected output in `w.y`.
-    pub fn record(&self, gpu: &Gpu, w: &Work, cache: &KvCache, c: &mut Commands) -> R {
+    /// Projects Q/K/V, applies RoPE and updates the cache.
+    pub fn record_state(&self, gpu: &Gpu, w: &Work, cache: &KvCache, c: &mut Commands) -> R {
         let (k, s) = (&gpu.kernels, &self.shape);
         let stride = s.qkv_len();
         let q_len = s.n_head * s.q_head_len();
@@ -130,17 +130,14 @@ impl VulkanAttention {
             k_norm: self.k_norm,
             bias: self.bias,
         };
+        k.prepare_attention(&w.batch, s, &w.proj, &consts, self.rope_table, cache, c)
+    }
+
+    /// Uses the prepared queries and cache to write the projected output to `w.y`.
+    pub fn record_output(&self, gpu: &Gpu, w: &Work, cache: &KvCache, c: &mut Commands) -> R {
+        let (k, s) = (&gpu.kernels, &self.shape);
         let att = w.mixed(s.n_head * s.head_dim);
-        k.attention(
-            &w.batch,
-            s,
-            &w.proj,
-            &consts,
-            self.rope_table,
-            cache,
-            att,
-            c,
-        )?;
+        k.attend_prepared(&w.batch, s, &w.proj, cache, att, c)?;
         w.project(k, att, &w.y, w.d, &[(&self.o, 0)], c)
     }
 }

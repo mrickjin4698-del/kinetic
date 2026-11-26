@@ -164,12 +164,35 @@ impl VulkanLayer {
         eps: f32,
         c: &mut Commands,
     ) -> R {
+        self.record_state(gpu, w, state, c)?;
+        self.record_output(gpu, w, state, next, eps, c)
+    }
+
+    /// Updates the recurrent state from this layer's input.
+    pub fn record_state(&self, gpu: &Gpu, w: &Work, state: &LayerState, c: &mut Commands) -> R {
         match (&self.mixer, state) {
-            (VulkanMixer::Attention(a), LayerState::Attention(cache)) => a.record(gpu, w, cache, c),
+            (VulkanMixer::Attention(a), LayerState::Attention(cache)) => {
+                a.record_state(gpu, w, cache, c)
+            }
             (VulkanMixer::ShortConv(s), LayerState::ShortConv(ring)) => s.record(gpu, w, ring, c),
             (VulkanMixer::DeltaNet(d), LayerState::DeltaNet(st)) => d.record(gpu, w, st, c),
             _ => unreachable!("state does not belong to this layer"),
-        }?;
+        }
+    }
+
+    /// Completes the layer after its state update.
+    pub fn record_output<'a>(
+        &'a self,
+        gpu: &Gpu,
+        w: &'a Work,
+        state: &LayerState,
+        next: &DeviceBuffer<f32>,
+        eps: f32,
+        c: &mut Commands,
+    ) -> R {
+        if let (VulkanMixer::Attention(a), LayerState::Attention(cache)) = (&self.mixer, state) {
+            a.record_output(gpu, w, cache, c)?;
+        }
         let k = &gpu.kernels;
         let add = |post: Option<&'a DeviceBuffer<f32>>| Residual {
             y: &w.y,

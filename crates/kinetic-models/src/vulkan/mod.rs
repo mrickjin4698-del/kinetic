@@ -427,7 +427,20 @@ impl<'m> VulkanModel<'m> {
         states: &[LayerState],
         prompt: bool,
     ) -> kinetic_vulkan::Result<Pass> {
+        let last = self.layers.len() - 1;
+        let complete_layer = |c: &mut Commands| {
+            c.set_prompt(prompt);
+            self.layers[last].record_output(
+                &self.gpu,
+                &work,
+                &states[last],
+                &self.output_norm,
+                self.eps,
+                c,
+            )
+        };
         let mut hidden = Commands::new(&self.gpu.device)?;
+        complete_layer(&mut hidden)?;
         hidden.download(
             work.h.values(),
             0,
@@ -436,6 +449,7 @@ impl<'m> VulkanModel<'m> {
             work.batch.rows() * self.n_embd,
         )?;
         let mut last_logits = Commands::new(&self.gpu.device)?;
+        complete_layer(&mut last_logits)?;
         self.record_head(&work, Head::Logits, &mut last_logits)?;
         last_logits.download(&work.logits, 0, &work.logits_host, 0, self.n_vocab())?;
         Ok(Pass {
@@ -468,11 +482,13 @@ impl<'m> VulkanModel<'m> {
         let first = &self.layers[0].mixer_norm;
         k.norm(&w.batch, &w.x, None, first, self.eps, &w.h, &mut c)?;
         for (i, (layer, state)) in self.layers.iter().zip(states).enumerate() {
-            let next = self
-                .layers
-                .get(i + 1)
-                .map_or(&self.output_norm, |l| &l.mixer_norm);
-            layer.record(&self.gpu, w, state, next, self.eps, &mut c)?;
+            let next = self.layers.get(i + 1);
+            if head == Head::None && next.is_none() {
+                layer.record_state(&self.gpu, w, state, &mut c)?;
+            } else {
+                let norm = next.map_or(&self.output_norm, |l| &l.mixer_norm);
+                layer.record(&self.gpu, w, state, norm, self.eps, &mut c)?;
+            }
         }
         if head == Head::None {
             return c.finish();
