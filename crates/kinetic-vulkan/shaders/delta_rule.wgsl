@@ -30,10 +30,6 @@ var<immediate> shape: Shape;
 @group(0) @binding(2) var<storage, read_write> state: array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read_write> out: array<f32>;
 
-fn journal_word(base: u32, word: u32) -> f32 {
-    return journal[base + word / 4u][word % 4u];
-}
-
 const PAIRED: bool = ROWS_PER_SUBGROUP == 2u;
 
 fn update(s: vec4<f32>, k: vec4<f32>, v: f32, decay: f32, b: f32) -> vec4<f32> {
@@ -59,8 +55,8 @@ fn main(
     let query_at = kh * (DK / 4u) + lane;
     let key_at = key_dim / 4u + query_at;
     let value_at = 2u * key_dim + row;
-    let decay_at = shape.channels + vh;
-    let beta_at = decay_at + shape.n_v_heads;
+    let factors_at = (shape.channels + 2u * vh) / 4u;
+    let high_pair = vh % 2u != 0u;
     let jstride = shape.journal_stride / 4u;
     let pos0 = batch[1];
     var end = pos0 + batch[0];
@@ -91,8 +87,10 @@ fn main(
         let k = raw_k * scales.y;
         let values = journal[base + value_at / 4u];
         let index = value_at % 4u;
-        let decay = journal_word(base, decay_at);
-        let b = journal_word(base, beta_at);
+        let word = journal[base + factors_at];
+        let factors = select(word.xy, word.zw, high_pair);
+        let decay = factors.x;
+        let b = factors.y;
         s = update(s, k, values[index], decay, b);
         if PAIRED {
             // The value head width is a multiple of 32. Both rows share

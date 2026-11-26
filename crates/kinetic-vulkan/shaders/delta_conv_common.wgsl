@@ -4,7 +4,7 @@
 // `proj` holds the `channels` convolution inputs, then `value_dim` output
 // gates, then one beta and one alpha per value head. The results go to the
 // token's journal slot, position % journal_slots, which delta_rule.wgsl
-// reads: the convolved channels, then the decays, then the step sizes.
+// reads: the convolved channels, then (decay, step size) for each value head.
 //
 // Raw inputs are kept in a ring as in short_conv.wgsl, so neither a pass
 // nor a rollback overwrites a position still read.
@@ -59,8 +59,9 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index
         let beta = proj[at + h];
         let alpha = proj[at + shape.n_v_heads + h];
         let decay = exp(softplus(alpha + heads[h]) * heads[shape.n_v_heads + h]);
-        journal[slot + shape.channels + h] = decay;
-        journal[slot + shape.channels + shape.n_v_heads + h] = 1.0 / (1.0 + exp(-beta));
+        let factors = slot + shape.channels + 2u * h;
+        journal[factors] = decay;
+        journal[factors + 1u] = 1.0 / (1.0 + exp(-beta));
         return;
     }
     let x = proj[t * shape.stride + ch];
