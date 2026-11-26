@@ -1,6 +1,8 @@
 use std::rc::Rc;
 
-use kinetic_vulkan::{Commands, ConvRing, DeltaState, Device, DeviceBuffer, KvCache, Residual};
+use kinetic_vulkan::{
+    Commands, ConvRing, DeltaState, Device, DeviceBuffer, KvCache, QkvPart, Residual,
+};
 
 use super::attention::VulkanAttention;
 use super::delta_net::VulkanDeltaNet;
@@ -166,20 +168,51 @@ impl VulkanLayer {
         eps: f32,
         c: &mut Commands,
     ) -> R {
-        self.record_state(gpu, w, state, c)?;
+        self.record_mixer(gpu, w, state, QkvPart::All, c)?;
         self.record_output(gpu, w, state, next, eps, c)
     }
 
     /// Updates the recurrent state from this layer's input.
-    pub fn record_state(&self, gpu: &Gpu, w: &Work, state: &LayerState, c: &mut Commands) -> R {
+    pub fn record_state(
+        &self,
+        gpu: &Gpu,
+        w: &Work,
+        state: &LayerState,
+        defer_queries: bool,
+        c: &mut Commands,
+    ) -> R {
+        let part = if defer_queries {
+            QkvPart::Cache
+        } else {
+            QkvPart::All
+        };
+        self.record_mixer(gpu, w, state, part, c)
+    }
+
+    fn record_mixer(
+        &self,
+        gpu: &Gpu,
+        w: &Work,
+        state: &LayerState,
+        part: QkvPart,
+        c: &mut Commands,
+    ) -> R {
         match (&self.mixer, state) {
             (VulkanMixer::Attention(a), LayerState::Attention(cache)) => {
-                a.record_state(gpu, w, cache, c)
+                a.record_inputs(gpu, w, cache, part, c)
             }
             (VulkanMixer::ShortConv(s), LayerState::ShortConv(ring)) => s.record(gpu, w, ring, c),
             (VulkanMixer::DeltaNet(d), LayerState::DeltaNet(st)) => d.record(gpu, w, st, c),
             _ => unreachable!("state does not belong to this layer"),
         }
+    }
+
+    /// Readies deferred queries after a pass has updated the KV cache.
+    pub fn record_queries(&self, gpu: &Gpu, w: &Work, state: &LayerState, c: &mut Commands) -> R {
+        if let (VulkanMixer::Attention(a), LayerState::Attention(cache)) = (&self.mixer, state) {
+            a.record_inputs(gpu, w, cache, QkvPart::Queries, c)?;
+        }
+        Ok(())
     }
 
     /// Completes the layer after its state update.

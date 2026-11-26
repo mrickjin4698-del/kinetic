@@ -189,7 +189,7 @@ impl Kernels {
             norm: Kernel::new(device, "norm", spirv!("norm"), 8, 4)?,
             swiglu: Kernel::new(device, "swiglu", spirv!("swiglu"), 5, 1)?,
             argmax: Kernel::new(device, "argmax", spirv!("argmax"), 3, 1)?,
-            rope: Kernel::new(device, "rope", spirv!("rope"), 5, 14)?,
+            rope: Kernel::new(device, "rope", spirv!("rope"), 5, 15)?,
             short_conv: Kernel::new(device, "short_conv", spirv!("short_conv"), 7, 3)?,
             delta_conv: Kernel::new(device, "delta_conv", spirv!("delta_conv"), 6, 8)?,
             delta_conv_4: matrix

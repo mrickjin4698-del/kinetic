@@ -1,6 +1,7 @@
 use kinetic_quant::Matrix;
 use kinetic_vulkan::{
     AttentionGate, AttentionShape, Commands, DeviceBuffer, DeviceMatrix, KvCache, QkvConsts,
+    QkvPart,
 };
 
 use super::layer::{unsupported, R};
@@ -112,17 +113,28 @@ impl VulkanAttention {
         }
     }
 
-    /// Projects Q/K/V, applies RoPE and updates the cache.
-    pub fn record_state(&self, gpu: &Gpu, w: &Work, cache: &KvCache, c: &mut Commands) -> R {
+    /// Projects and readies the requested inputs for attention.
+    pub fn record_inputs(
+        &self,
+        gpu: &Gpu,
+        w: &Work,
+        cache: &KvCache,
+        part: QkvPart,
+        c: &mut Commands,
+    ) -> R {
         let (k, s) = (&gpu.kernels, &self.shape);
         let stride = s.qkv_len();
         let q_len = s.n_head * s.q_head_len();
-        let mut projections = vec![
-            (&self.q, 0),
-            (&self.k, q_len),
-            (&self.v, q_len + s.kv_dim()),
-        ];
-        projections.extend(self.head_gate.iter().map(|g| (g, s.gate_at())));
+        let mut projections = Vec::with_capacity(4);
+        if part != QkvPart::Cache {
+            projections.push((&self.q, 0));
+        }
+        if part != QkvPart::Queries {
+            projections.extend([(&self.k, q_len), (&self.v, q_len + s.kv_dim())]);
+        }
+        if part != QkvPart::Cache {
+            projections.extend(self.head_gate.iter().map(|g| (g, s.gate_at())));
+        }
         w.project(k, &w.h, &w.proj, stride, &projections, c)?;
         let consts = QkvConsts {
             data: &self.consts,
@@ -130,7 +142,16 @@ impl VulkanAttention {
             k_norm: self.k_norm,
             bias: self.bias,
         };
-        k.prepare_attention(&w.batch, s, &w.proj, &consts, self.rope_table, cache, c)
+        k.prepare_attention_part(
+            &w.batch,
+            s,
+            &w.proj,
+            &consts,
+            self.rope_table,
+            cache,
+            part,
+            c,
+        )
     }
 
     /// Uses the prepared queries and cache to write the projected output to `w.y`.

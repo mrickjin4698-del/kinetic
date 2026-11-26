@@ -428,9 +428,14 @@ impl<'m> VulkanModel<'m> {
         prompt: bool,
     ) -> kinetic_vulkan::Result<Pass> {
         let last = self.layers.len() - 1;
+        let defer_queries = prompt && work.batch.rows() > PROMPT_SHORT;
         let complete_layer = |c: &mut Commands| {
             c.set_prompt(prompt);
-            self.layers[last].record_output(
+            let layer = &self.layers[last];
+            if defer_queries {
+                layer.record_queries(&self.gpu, &work, &states[last], c)?;
+            }
+            layer.record_output(
                 &self.gpu,
                 &work,
                 &states[last],
@@ -453,11 +458,11 @@ impl<'m> VulkanModel<'m> {
         self.record_head(&work, Head::Logits, &mut last_logits)?;
         last_logits.download(&work.logits, 0, &work.logits_host, 0, self.n_vocab())?;
         Ok(Pass {
-            state: self.record(&work, states, Head::None, prompt)?,
+            state: self.record(&work, states, Head::None, prompt, defer_queries)?,
             hidden: hidden.finish()?,
             last_logits: last_logits.finish()?,
-            greedy: self.record(&work, states, Head::Greedy, prompt)?,
-            logits: self.record(&work, states, Head::Logits, prompt)?,
+            greedy: self.record(&work, states, Head::Greedy, prompt, false)?,
+            logits: self.record(&work, states, Head::Logits, prompt, false)?,
             logits_tail: (1..work.batch.head_rows()).map(|_| None).collect(),
             work,
         })
@@ -470,6 +475,7 @@ impl<'m> VulkanModel<'m> {
         states: &[LayerState],
         head: Head,
         prompt: bool,
+        defer_queries: bool,
     ) -> kinetic_vulkan::Result<Graph> {
         let (k, d) = (&self.gpu.kernels, self.n_embd);
         let mut c = Commands::new(&self.gpu.device)?;
@@ -484,7 +490,7 @@ impl<'m> VulkanModel<'m> {
         for (i, (layer, state)) in self.layers.iter().zip(states).enumerate() {
             let next = self.layers.get(i + 1);
             if head == Head::None && next.is_none() {
-                layer.record_state(&self.gpu, w, state, &mut c)?;
+                layer.record_state(&self.gpu, w, state, defer_queries, &mut c)?;
             } else {
                 let norm = next.map_or(&self.output_norm, |l| &l.mixer_norm);
                 layer.record(&self.gpu, w, state, norm, self.eps, &mut c)?;

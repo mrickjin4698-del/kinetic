@@ -98,7 +98,7 @@ pub const API: &str = "Vulkan";
 #[cfg(metal_driver)]
 pub const API: &str = "Metal";
 
-pub use attention::{AttentionGate, AttentionShape, KvCache, QkvConsts};
+pub use attention::{AttentionGate, AttentionShape, KvCache, QkvConsts, QkvPart};
 pub use batch::{Batch, BATCH_HEADER};
 pub use commands::{Commands, Graph, Timestamp, Timings};
 pub use delta_net::{DeltaShape, DeltaState, DeltaWeights};

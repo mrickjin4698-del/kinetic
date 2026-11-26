@@ -24,6 +24,7 @@ struct Shape {
     k_norm: u32,
     slots: u32,
     packed_kv: u32,
+    first_head: u32,
 }
 
 // Bits of `flags`.
@@ -82,7 +83,7 @@ fn main(
     if t >= batch[0] {
         return;
     }
-    let slot = group.x;
+    let slot = shape.first_head + group.x;
     let hd = shape.head_dim;
     let kv_dim = shape.n_kv * hd;
     let q_len = shape.n_head * shape.q_head_len;

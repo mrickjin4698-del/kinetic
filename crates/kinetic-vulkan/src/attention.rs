@@ -208,6 +208,14 @@ impl KvCache {
     }
 }
 
+/// Which projections to ready for attention.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum QkvPart {
+    All,
+    Queries,
+    Cache,
+}
+
 /// Weights that ready queries and keys, inside one buffer: per-head norms
 /// of `head_dim` values and a bias of one value per projected value, each
 /// at an element offset.
@@ -242,7 +250,7 @@ impl Kernels {
             batch,
             shape,
             qkv,
-            Some((consts, rope_table)),
+            Some((consts, rope_table, QkvPart::All)),
             cache,
             Some(out),
             commands,
@@ -261,11 +269,36 @@ impl Kernels {
         cache: &KvCache,
         commands: &mut Commands,
     ) -> Result<()> {
+        self.prepare_attention_part(
+            batch,
+            shape,
+            qkv,
+            consts,
+            rope_table,
+            cache,
+            QkvPart::All,
+            commands,
+        )
+    }
+
+    /// Readies the queries, writes the cache, or does both for this batch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_attention_part(
+        &self,
+        batch: &Batch,
+        shape: &AttentionShape,
+        qkv: &DeviceBuffer<f32>,
+        consts: &QkvConsts,
+        rope_table: usize,
+        cache: &KvCache,
+        part: QkvPart,
+        commands: &mut Commands,
+    ) -> Result<()> {
         self.record_attention(
             batch,
             shape,
             qkv,
-            Some((consts, rope_table)),
+            Some((consts, rope_table, part)),
             cache,
             None,
             commands,
@@ -292,7 +325,7 @@ impl Kernels {
         batch: &Batch,
         shape: &AttentionShape,
         qkv: &DeviceBuffer<f32>,
-        prepare: Option<(&QkvConsts, usize)>,
+        prepare: Option<(&QkvConsts, usize, QkvPart)>,
         cache: &KvCache,
         out: Option<&GemvInput>,
         commands: &mut Commands,
@@ -305,7 +338,7 @@ impl Kernels {
             && cache.rows >= rows
             && cache.size_bytes() == 4 * cache.slots * shape.kv_dim()
             && out.is_none_or(|out| out.width() == shape.n_head * hd && out.rows() >= rows)
-            && prepare.is_none_or(|(consts, rope_table)| {
+            && prepare.is_none_or(|(consts, rope_table, _)| {
                 let within =
                     |at: Option<usize>, len: usize| at.is_none_or(|a| a + len <= consts.data.len());
                 rope_table + rows * shape.rope_dims <= batch.table_words()
@@ -321,7 +354,12 @@ impl Kernels {
         let packed = cache.values.is_none();
         let values = cache.values.as_ref().unwrap_or(&self.single).allocation();
         let batch_words = batch.device().allocation();
-        if let Some((consts, rope_table)) = prepare {
+        if let Some((consts, rope_table, part)) = prepare {
+            let (first, heads) = match part {
+                QkvPart::All => (0, shape.n_head + 2 * shape.n_head_kv),
+                QkvPart::Queries => (0, shape.n_head),
+                QkvPart::Cache => (shape.n_head, 2 * shape.n_head_kv),
+            };
             let flag = |on: bool, bit: u32| if on { bit } else { 0 };
             let flags = flag(shape.rope_adjacent, 1)
                 | flag(shape.norm_after_rope, 2)
@@ -357,8 +395,9 @@ impl Kernels {
                         word(consts.k_norm),
                         cache.slots as u32,
                         packed as u32,
+                        first as u32,
                     ],
-                    [(shape.n_head + 2 * shape.n_head_kv) as u32, rows as u32, 1],
+                    [heads as u32, rows as u32, 1],
                 )
             };
         }
