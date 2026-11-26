@@ -8,10 +8,6 @@ fn stage(total: u32, blk: u32, s: u32, h: u32, at: u32) {
     let q = w[blk * 2u + h];
     let d = f16(f16_at(total * 2u, blk));
     for (var j = 0u; j < 4u; j++) {
-        let v = unpack4xI8(q[j]);
-        wa[at + 4u * j] = f16(v.x) * d;
-        wa[at + 4u * j + 1u] = f16(v.y) * d;
-        wa[at + 4u * j + 2u] = f16(v.z) * d;
-        wa[at + 4u * j + 3u] = f16(v.w) * d;
+        wa[at + j] = vec4<f16>(unpack4xI8(q[j])) * d;
     }
 }

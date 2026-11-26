@@ -14,11 +14,8 @@ fn stage(total: u32, blk: u32, s: u32, h: u32, at: u32) {
     let b = dm.y * sm.y;
     let shift = 4u * (s % 2u);
     for (var j = 0u; j < 4u; j++) {
-        let word = q[j] >> shift;
-        let high = qh[j] >> s;
-        for (var i = 0u; i < 4u; i++) {
-            let v = ((word >> (8u * i)) & 15u) | (((high >> (8u * i)) & 1u) << 4u);
-            wa[at + 4u * j + i] = f16(a * f32(v) - b);
-        }
+        let lo = unpack4xU8(q[j] >> shift) & vec4<u32>(15u);
+        let hi = (unpack4xU8(qh[j] >> s) & vec4<u32>(1u)) << vec4<u32>(4u);
+        wa[at + j] = vec4<f16>(a * vec4<f32>(lo | hi) - vec4<f32>(b));
     }
 }

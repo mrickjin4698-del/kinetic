@@ -46,12 +46,13 @@ var<immediate> shape: Shape;
 // TILE, the rows and tokens of a workgroup, comes from build.rs; the
 // subgroup quarters and the staging below are laid out for 64.
 const_assert TILE == 64u;
-// f16 per row of a staged block: 32 and padding against bank conflicts
-const LD: u32 = 40u;
+// Vectors of four f16 per row of a staged block: eight data and two pad
+// against bank conflicts. Cooperative loads take strides in vector units.
+const LD: u32 = 10u;
 
 // weights [row][k] and inputs [token][k] of one step of 32 columns
-var<workgroup> wa: array<f16, TILE * LD>;
-var<workgroup> xb: array<f16, TILE * LD>;
+var<workgroup> wa: array<vec4<f16>, TILE * LD>;
+var<workgroup> xb: array<vec4<f16>, TILE * LD>;
 // the finished tile, [token][row]
 var<workgroup> out: array<f32, TILE * TILE>;
 // the batch's first token and token count. Every variable here is a
@@ -131,18 +132,14 @@ fn main(
 
     for (var ks = 0u; ks < steps; ks++) {
         let blk = wrow * n + ks / SUB;
-        stage(total, blk, ks % SUB, half, r * LD + half * 16u);
+        let at = r * LD + half * 4u;
+        stage(total, blk, ks % SUB, half, at);
         let xi = xrow * steps * 8u + ks * 8u + half * 4u;
         for (var j = 0u; j < 4u; j++) {
-            let v = x[xi + j] * sx;
-            let at = r * LD + half * 16u + j * 4u;
-            xb[at] = f16(v.x);
-            xb[at + 1u] = f16(v.y);
-            xb[at + 2u] = f16(v.z);
-            xb[at + 3u] = f16(v.w);
+            xb[at + j] = vec4<f16>(x[xi + j] * sx);
         }
         workgroupBarrier();
-        for (var kk = 0u; kk < 32u; kk += 16u) {
+        for (var kk = 0u; kk < 8u; kk += 4u) {
             let a0 = coopLoadT<coop_mat16x16<f16, A>>(&wa[qr * LD + kk], LD);
             let a1 = coopLoadT<coop_mat16x16<f16, A>>(&wa[(qr + 16u) * LD + kk], LD);
             let b0 = coopLoad<coop_mat16x16<f16, B>>(&xb[qt * LD + kk], LD);

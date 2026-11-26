@@ -22,11 +22,8 @@ fn stage(total: u32, blk: u32, s: u32, h: u32, at: u32) {
     let lshift = 4u * (g / 2u);
     let hshift = 2u * g;
     for (var j = 0u; j < 4u; j++) {
-        let lo = lq[j] >> lshift;
-        let hi = hq[j] >> hshift;
-        for (var i = 0u; i < 4u; i++) {
-            let q = ((lo >> (8u * i)) & 15u) | (((hi >> (8u * i)) & 3u) << 4u);
-            wa[at + 4u * j + i] = f16(scale * (f32(q) - 32.0));
-        }
+        let lo = unpack4xU8(lq[j] >> lshift) & vec4<u32>(15u);
+        let hi = (unpack4xU8(hq[j] >> hshift) & vec4<u32>(3u)) << vec4<u32>(4u);
+        wa[at + j] = vec4<f16>(scale * (vec4<f32>(lo | hi) - vec4<f32>(32.0)));
     }
 }
