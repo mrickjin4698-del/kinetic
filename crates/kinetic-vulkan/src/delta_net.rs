@@ -296,7 +296,11 @@ impl Kernels {
         // SAFETY: matches delta_rule.wgsl; the caller checked the sizes.
         unsafe {
             commands.dispatch(
-                &self.delta_rule,
+                if state.rows.is_power_of_two() {
+                    &self.delta_rule_masked
+                } else {
+                    &self.delta_rule
+                },
                 &[
                     batch_words,
                     state.journal.allocation(),

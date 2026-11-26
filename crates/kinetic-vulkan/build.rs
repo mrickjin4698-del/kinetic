@@ -33,7 +33,16 @@ const KERNELS: &[(&str, &str, &[&str])] = &[
         "",
         &["delta_qk_scale", "delta_prepare_norms"],
     ),
-    ("delta_rule", "", &["delta_qk_scale", "delta_rule"]),
+    (
+        "delta_rule",
+        "const MASK_SLOTS: bool = false;",
+        &["delta_qk_scale", "delta_rule"],
+    ),
+    (
+        "delta_rule_masked",
+        "const MASK_SLOTS: bool = true;",
+        &["delta_qk_scale", "delta_rule"],
+    ),
     ("gated_norm", "", &["gated_norm", "put_q8"]),
     (
         "attend_64",

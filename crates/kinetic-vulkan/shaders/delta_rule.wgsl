@@ -65,7 +65,11 @@ fn main(
     let at = row * (DK / 4u) + lane;
     var s = state[at];
     for (var p = batch[4]; p < end; p++) {
-        let base = p % shape.journal_slots * jstride;
+        var journal_slot = p & (shape.journal_slots - 1u);
+        if !MASK_SLOTS {
+            journal_slot = p % shape.journal_slots;
+        }
+        let base = journal_slot * jstride;
         let raw_k = journal[base + key_at];
         var scales: vec2<f32>;
         if shape.prepared_norms != 0u {
