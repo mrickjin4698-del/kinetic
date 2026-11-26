@@ -296,6 +296,11 @@ impl<'m> VulkanModel<'m> {
         state.prompt = prompt;
     }
 
+    /// Most tokens the model can process in one prompt pass.
+    pub fn prefill_batch(&self) -> usize {
+        self.prompt_batch
+    }
+
     /// The name of the device the model runs on.
     pub fn device_name(&self) -> &str {
         &self.name

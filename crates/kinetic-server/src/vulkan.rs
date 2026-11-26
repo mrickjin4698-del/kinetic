@@ -152,7 +152,8 @@ impl<'a> VulkanBackend<'a> {
     /// keeps each new prompt's state there. `warm` must hold only states
     /// this device made; see [`kinetic_models::warm::device_id`].
     pub fn with_warm(mut self, warm: Warm<'a>) -> Self {
-        self.warm = Some(warm.aligned(PREFILL_CHUNK));
+        let batches = self.prefill_chunk() / PREFILL_CHUNK;
+        self.warm = Some(warm.aligned(PREFILL_CHUNK).batches_per_call(batches));
         self
     }
 
@@ -160,6 +161,10 @@ impl<'a> VulkanBackend<'a> {
     /// Vulkan.
     pub fn device(&self) -> &str {
         &self.device
+    }
+
+    fn prefill_chunk(&self) -> usize {
+        self.gpu.prefill_batch().max(PREFILL_CHUNK)
     }
 
     /// The cached sequence when `prompt` extends it, else a new one, run up
@@ -170,7 +175,7 @@ impl<'a> VulkanBackend<'a> {
         prompt: &[u32],
         policy: &mut impl Policy<VulkanModel<'a>>,
     ) -> (Sequence<VulkanState>, usize, Option<Keep>) {
-        let chunk = PREFILL_CHUNK;
+        let chunk = self.prefill_chunk();
         // the empty sequence made at load time leaves warm starts their go
         let fresh = |s: &Sequence<VulkanState>| s.tokens.is_empty() && self.warm.is_some();
         // prompt passes on the matrix units sum unlike decode steps, so a
@@ -193,8 +198,8 @@ impl<'a> VulkanBackend<'a> {
             old => old,
         };
         self.decoder.reset(&self.gpu);
-        // the batches a cold prefill runs before its last one
-        let head = &prompt[..(prompt.len() - 1) / chunk * chunk];
+        // Warm entries end on the cache alignment.
+        let head = &prompt[..(prompt.len() - 1) / PREFILL_CHUNK * PREFILL_CHUNK];
         let (mut seq, reused, keep) = match self.warm.as_mut().filter(|_| !head.is_empty()) {
             Some(warm) => {
                 let runner = VulkanRunner {

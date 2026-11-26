@@ -54,7 +54,7 @@ fn prompts_give_the_same_bits_however_cut() {
     let mut state = gpu.new_state().unwrap();
 
     let whole = run_cut(&gpu, &mut state, &ids, ids.len());
-    for cut in [1, 3, 17, 64, 65, 100, 511, 512, 513] {
+    for cut in [1, 3, 17, 64, 65, 100, 256, 511, 512, 513] {
         assert_eq!(run_cut(&gpu, &mut state, &ids, cut), whole, "cut {cut}");
     }
 
