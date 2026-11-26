@@ -7,8 +7,8 @@ use std::rc::Rc;
 use half::f16;
 use kinetic_quant::{dequantize, Matrix, TensorType};
 use kinetic_vulkan::{
-    Batch, Commands, Device, DeviceBuffer, DeviceMatrix, Error, GemvInput, Instance, Kernels, Out,
-    Rows,
+    AttentionGate, AttentionShape, Batch, Commands, Device, DeviceBuffer, DeviceMatrix, Error,
+    GemvInput, Instance, Kernels, KvCache, Out, QkvConsts, Rows,
 };
 
 struct Gpu {
@@ -447,5 +447,68 @@ fn k_quant_matrix_passes_match_reference() {
     for ty in [TensorType::Q4K, TensorType::Q5K, TensorType::Q6K] {
         check_matrix_pass(ty, 37, 5 * 256, 32, 21, false);
         check_matrix_pass(ty, 128, 3 * 256, 160, 130, false);
+    }
+}
+
+#[test]
+fn sliding_attention_matches_contiguous_cache() {
+    for gpu in gpus() {
+        let positions = 20;
+        let mut rng = Lcg(1);
+        for window in [1, 3, 6] {
+            let shape = AttentionShape {
+                n_head: 2,
+                n_head_kv: 1,
+                head_dim: 64,
+                rope_dims: 0,
+                rope_adjacent: false,
+                norm_after_rope: false,
+                gate: AttentionGate::None,
+                window: Some(window),
+                scale: 0.125,
+                eps: 1e-5,
+            };
+            let ring = KvCache::new(&gpu.device, &shape, positions, 1).unwrap();
+            let full = KvCache::new(&gpu.device, &shape, positions, positions).unwrap();
+            assert_eq!(ring.slots(), window + 1);
+            assert_eq!(full.slots(), positions);
+
+            let mut batch = Batch::new(&gpu.device, 1, 0, positions, 0).unwrap();
+            let mut qkv = DeviceBuffer::new(&gpu.device, shape.qkv_len()).unwrap();
+            let constants = DeviceBuffer::from_slice(&gpu.device, &[0.0]).unwrap();
+            let consts = QkvConsts {
+                data: &constants,
+                q_norm: None,
+                k_norm: None,
+                bias: None,
+            };
+            let out = GemvInput::batch(&gpu.device, shape.n_head * shape.head_dim, 1).unwrap();
+
+            for pos in 0..positions {
+                let input: Vec<_> = (0..shape.qkv_len()).map(|_| rng.f32()).collect();
+                batch.set(1, pos, 0..0, None).unwrap();
+                let mut attend = |cache| {
+                    qkv.copy_from(&input).unwrap();
+                    let mut commands = Commands::new(&gpu.device).unwrap();
+                    batch.record_upload(&mut commands).unwrap();
+                    gpu.kernels
+                        .attention(&batch, &shape, &qkv, &consts, 0, cache, &out, &mut commands)
+                        .unwrap();
+                    commands.submit().unwrap();
+                    out.values().to_vec().unwrap()
+                };
+                let wrapped = attend(&ring);
+                let contiguous = attend(&full);
+                assert!(contiguous.iter().any(|&v| v != 0.0));
+                for (i, (&a, &b)) in wrapped.iter().zip(&contiguous).enumerate() {
+                    assert!(b.is_finite());
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "window {window} position {pos} element {i}"
+                    );
+                }
+            }
+        }
     }
 }

@@ -70,8 +70,14 @@ fn main(
     var m = LOWEST;
     var l = 0.0;
     let first = kv_head * HD / 2u + lane;
-    for (var p = start + slot; p < len; p += SUBGROUPS) {
-        let row = p % shape.slots * row_words + first;
+    let first_pos = start + slot;
+    // Walk the ring in words, wrapping once if the stride crosses its end.
+    let cache_step = SUBGROUPS % shape.slots;
+    let word_step = cache_step * row_words;
+    let wrap_at = (shape.slots - cache_step) * row_words;
+    var cache_offset = (first_pos % shape.slots) * row_words;
+    for (var p = first_pos; p < len; p += SUBGROUPS) {
+        let row = cache_offset + first;
         var qk = 0.0;
         for (var k = 0u; k < PAIRS; k++) {
             qk += dot(q[k], unpack2x16float(kc[row + 32u * k]));
@@ -85,6 +91,7 @@ fn main(
             acc[k] = acc[k] * c + e * unpack2x16float(vc[row + 32u * k]);
         }
         m = next;
+        cache_offset = select(cache_offset + word_step, cache_offset - wrap_at, cache_offset >= wrap_at);
     }
     if lane == 0u {
         top[slot] = m;
