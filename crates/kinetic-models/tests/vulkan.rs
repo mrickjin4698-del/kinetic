@@ -91,10 +91,11 @@ fn prompts_give_the_same_bits_however_cut() {
     assert_eq!(bits(&runner.forward(&mut state, &ids)), whole);
     assert_eq!(state.len(), ids.len());
 
-    // Sampled draft verification asks for all rows on a checkpointed
-    // decode pass. Changing the row count also exercises cached readbacks.
-    let prefix = &ids[..64];
-    let draft = &ids[64..80];
+    // Keep a long committed prompt before testing the checkpointed decoder,
+    // so the first draft consumes the convolution tail saved by prefill.
+    // Changing the draft row count also exercises cached readbacks.
+    let prefix = &ids[..128];
+    let draft = &ids[128..144];
     gpu.reset(&mut state).unwrap();
     gpu.set_prompt(&mut state, true);
     gpu.advance(&mut state, prefix).unwrap();

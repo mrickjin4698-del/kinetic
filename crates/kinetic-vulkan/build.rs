@@ -27,7 +27,16 @@ const KERNELS: &[(&str, &str, &[&str])] = &[
     ("argmax", "", &["argmax"]),
     ("rope", "", &["rope"]),
     ("short_conv", "", &["short_conv", "put_q8"]),
-    ("delta_conv", "", &["delta_conv"]),
+    (
+        "delta_conv",
+        "const COMMITTED_TAIL_ONLY: bool = false;",
+        &["delta_conv_common", "delta_conv"],
+    ),
+    (
+        "delta_conv_4",
+        "const COMMITTED_TAIL_ONLY: bool = true;",
+        &["delta_conv_common", "delta_conv_4"],
+    ),
     (
         "delta_prepare_norms",
         "",

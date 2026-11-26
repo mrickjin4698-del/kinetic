@@ -61,6 +61,7 @@ pub struct Kernels {
     pub(crate) rope: Rc<Kernel>,
     pub(crate) short_conv: Rc<Kernel>,
     pub(crate) delta_conv: Rc<Kernel>,
+    pub(crate) delta_conv_4: Option<Rc<Kernel>>,
     pub(crate) delta_prepare_norms: Rc<Kernel>,
     pub(crate) delta_rule: Rc<Kernel>,
     pub(crate) delta_rule_masked: Rc<Kernel>,
@@ -191,6 +192,9 @@ impl Kernels {
             rope: Kernel::new(device, "rope", spirv!("rope"), 5, 14)?,
             short_conv: Kernel::new(device, "short_conv", spirv!("short_conv"), 7, 3)?,
             delta_conv: Kernel::new(device, "delta_conv", spirv!("delta_conv"), 6, 8)?,
+            delta_conv_4: matrix
+                .then(|| Kernel::new(device, "delta_conv_4", spirv!("delta_conv_4"), 6, 8))
+                .transpose()?,
             delta_prepare_norms: Kernel::new(
                 device,
                 "delta_prepare_norms",

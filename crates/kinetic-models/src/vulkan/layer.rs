@@ -138,7 +138,9 @@ impl VulkanLayer {
             VulkanMixer::ShortConv(s) => {
                 LayerState::ShortConv(ConvRing::new(dev, s.channels(), s.taps, rows)?)
             }
-            VulkanMixer::DeltaNet(d) => LayerState::DeltaNet(DeltaState::new(dev, &d.shape, rows)?),
+            VulkanMixer::DeltaNet(d) => {
+                LayerState::DeltaNet(DeltaState::new_with_committed_tail(dev, &d.shape, rows)?)
+            }
         })
     }
 

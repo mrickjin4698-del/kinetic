@@ -77,6 +77,7 @@ pub struct DeltaState {
     ring: ConvRing,
     journal: DeviceBuffer<f32>,
     rows: usize,
+    committed_tail_only: bool,
 }
 
 impl DeltaState {
@@ -90,7 +91,21 @@ impl DeltaState {
             ring: ConvRing::new(device, shape.channels(), shape.conv_taps, rows)?,
             journal: DeviceBuffer::new(device, rows * shape.journal_stride())?,
             rows,
+            committed_tail_only: false,
         })
+    }
+
+    /// A state that can discard convolution inputs before the live tail of
+    /// a committed prompt pass. Resume at the end of the pass or restore a
+    /// snapshot. Passes after a checkpoint keep the inputs rollback needs.
+    pub fn new_with_committed_tail(
+        device: &Rc<Device>,
+        shape: &DeltaShape,
+        rows: usize,
+    ) -> Result<DeltaState> {
+        let mut state = Self::new(device, shape, rows)?;
+        state.committed_tail_only = true;
+        Ok(state)
     }
 
     /// The per-head matrices, `head_v_dim` rows of `head_k_dim` each.
@@ -184,7 +199,14 @@ impl Kernels {
         }
         let b = batch.device().allocation();
         let [ox, oq, od] = out.outputs();
-        // SAFETY: delta_conv.wgsl takes the batch, proj, conv weights, head
+        let conv = self
+            .delta_conv_4
+            .as_ref()
+            .filter(|_| {
+                state.committed_tail_only && shape.conv_taps == 4 && commands.prompt() && rows > 64
+            })
+            .unwrap_or(&self.delta_conv);
+        // SAFETY: delta_conv_common.wgsl takes the batch, proj, conv weights, head
         // constants, ring and journal at bindings 0..5; delta_rule.wgsl the
         // batch, journal, matrices and `rec` at 0..3; gated_norm.wgsl the
         // batch, `rec`, proj, norm and the three output buffers at 0..6;
@@ -194,7 +216,7 @@ impl Kernels {
         // past the pass's tokens return early.
         unsafe {
             commands.dispatch(
-                &self.delta_conv,
+                conv,
                 &[
                     b,
                     proj.allocation(),
