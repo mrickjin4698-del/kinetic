@@ -3,6 +3,7 @@ use std::rc::Rc;
 
 use ash::vk;
 
+use crate::cooperative_matrix2;
 use crate::error::{Check, Result};
 use crate::info::{DeviceInfo, DeviceKind, Features};
 use crate::instance::{Instance, API_VERSION};
@@ -28,6 +29,7 @@ pub struct PhysicalDevice {
     pub(crate) compute_family: Option<u32>,
     pub(crate) memory: vk::PhysicalDeviceMemoryProperties,
     info: DeviceInfo,
+    pub(crate) matrix2: bool,
 }
 
 impl PhysicalDevice {
@@ -68,6 +70,7 @@ impl PhysicalDevice {
         };
         let mut driver_name = String::new();
         let mut driver_info = String::new();
+        let mut matrix2 = false;
         if props.api_version >= API_VERSION {
             let mut p11 = vk::PhysicalDeviceVulkan11Properties::default();
             let mut p12 = vk::PhysicalDeviceVulkan12Properties::default();
@@ -81,12 +84,19 @@ impl PhysicalDevice {
             let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
             let mut coop = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
             let has_coop = has_extension(ash::khr::cooperative_matrix::NAME);
+            let has_cm2 = has_coop && has_extension(cooperative_matrix2::NAME);
+            let mut cm2 = cooperative_matrix2::Features::new(false);
+            let mut cm2_props = cooperative_matrix2::Properties::default();
             let mut f2 = vk::PhysicalDeviceFeatures2::default()
                 .push_next(&mut f11)
                 .push_next(&mut f12)
                 .push_next(&mut f13);
             if has_coop {
                 f2 = f2.push_next(&mut coop);
+            }
+            if has_cm2 {
+                f2 = f2.push_next(&mut cm2);
+                p2 = p2.push_next(&mut cm2_props);
             }
             // SAFETY: as above; the chains hold only core 1.3 structures and,
             // when the extension exists, its own feature structure.
@@ -124,6 +134,11 @@ impl PhysicalDevice {
                 && f11.storage_buffer16_bit_access == vk::TRUE
                 && f11.uniform_and_storage_buffer16_bit_access == vk::TRUE
                 && has_matrix_f16(instance, raw);
+            matrix2 = features.matrix_f16
+                && has_cm2
+                && cm2.supported()
+                && cm2_props.supports_tile(props.limits.max_compute_shared_memory_size)
+                && cooperative_matrix2::has_tile(instance, raw);
             driver_name = c_text(p12.driver_name_as_c_str());
             driver_info = c_text(p12.driver_info_as_c_str());
         }
@@ -159,6 +174,7 @@ impl PhysicalDevice {
             compute_family,
             memory,
             info,
+            matrix2,
         })
     }
 }

@@ -1,0 +1,109 @@
+#version 460
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_NV_cooperative_matrix2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_memory_scope_semantics : require
+#pragma use_vulkan_memory_model
+
+// Packed Q8 prompt projections. The driver loads activations directly,
+// and each workgroup expands a Q8 weight block for reuse by 128 tokens.
+// Regenerate from this directory with Khronos glslang 16.6.0.
+// glslang -V --target-env vulkan1.3 -Os --spirv-val -o mm_q8_0_cm2.spv mm_q8_0_cm2.comp
+layout(local_size_x = 128) in;
+layout(push_constant) uniform Shape {
+    uint rows;
+    uint blocks;
+    uint stride;
+    uint offset;
+    uint head;
+} shape;
+layout(std430, binding = 0) readonly buffer Weights { uvec4 words[]; } weight;
+layout(std430, binding = 2) readonly buffer Packed { float16_t values[]; } packed;
+layout(std430, binding = 3) readonly buffer Scales { vec2 values[]; } inv_scale;
+layout(std430, binding = 4) writeonly buffer Output { float values[]; } output_data;
+layout(std430, binding = 5) readonly buffer Batch { uint words[]; } batch;
+
+const uint ROWS = 64;
+const uint TOKENS = 128;
+const uint K_STEP = 32;
+const uint BLOCK = 32;
+const uint GROUP_ROWS = 4;
+
+shared uvec4 active_tokens;
+// Pad each f16 weight row to a 32-byte multiple for workgroup matrix loads.
+const uint WEIGHT_STRIDE = 12;
+shared f16vec4 weight_tile[ROWS * WEIGHT_STRIDE];
+
+f16vec4 unpack_weights(uint quants, float16_t scale) {
+    uvec2 bits = (uvec2(quants, quants >> 8) & 0x00ff00ffu) ^ 0x64806480u;
+    vec2 even = unpackHalf2x16(bits.x);
+    vec2 odd = unpackHalf2x16(bits.y);
+    return (f16vec4(even.x, odd.x, even.y, odd.y) - f16vec4(1152.0)) * scale;
+}
+
+void stage_weights(uint row, uint block) {
+    for (uint lane = gl_LocalInvocationIndex; lane < ROWS; lane += gl_WorkGroupSize.x) {
+        uint wr = row + lane;
+        uint at = (wr / GROUP_ROWS * shape.blocks + block) * GROUP_ROWS + wr % GROUP_ROWS;
+        uint pair = weight.words[shape.rows * shape.blocks * 2 + at / 8][(at / 2) % 4];
+        float16_t scale = float16_t(unpackHalf2x16(pair)[at & 1]);
+        uvec4 low = weight.words[at * 2];
+        uvec4 high = weight.words[at * 2 + 1];
+        for (uint i = 0; i < 4; ++i) {
+            f16vec4 a = unpack_weights(low[i], scale);
+            f16vec4 b = unpack_weights(high[i], scale);
+            weight_tile[lane * WEIGHT_STRIDE + i] = a;
+            weight_tile[lane * WEIGHT_STRIDE + 4 + i] = b;
+        }
+    }
+}
+
+float scale_output(const in uint row, const in uint token, const in float value,
+                   const in uint origin, const in uint count) {
+    return value * inv_scale.values[min(origin + token, count - 1)].x;
+}
+
+void main() {
+    if (gl_LocalInvocationIndex == 0) {
+        active_tokens = uvec4(batch.words[0], 0, 0, 0);
+    }
+    barrier();
+    uint count = active_tokens.x;
+    uint row = gl_WorkGroupID.x * ROWS;
+    uint token = gl_WorkGroupID.y * TOKENS;
+    if (token >= count) {
+        return;
+    }
+
+    // The pack pass stores [K block][token][K within block].
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> inputs =
+        createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    inputs = setTensorLayoutDimensionNV(inputs, count, BLOCK);
+    tensorViewNV<2, false, 1, 0> transpose = createTensorViewNV(2, false, 1, 0);
+
+    coopmat<float, gl_ScopeWorkgroup, ROWS, TOKENS, gl_MatrixUseAccumulator> sum =
+        coopmat<float, gl_ScopeWorkgroup, ROWS, TOKENS, gl_MatrixUseAccumulator>(0.0);
+    for (uint block = 0; block < shape.blocks; ++block) {
+        stage_weights(row, block);
+        barrier();
+        // Keep this loop for the tested driver schedule. Expanding it into
+        // straight-line code made the workgroup matrix pass slower.
+        for (uint k = 0; k < BLOCK; k += K_STEP) {
+            coopmat<float16_t, gl_ScopeWorkgroup, ROWS, K_STEP, gl_MatrixUseA> a;
+            coopmat<float16_t, gl_ScopeWorkgroup, K_STEP, TOKENS, gl_MatrixUseB> b;
+            coopMatLoad(a, weight_tile, k / 4, WEIGHT_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoadTensorNV(b, packed.values, block * count * BLOCK,
+                sliceTensorLayoutNV(inputs, int(token), TOKENS, int(k), K_STEP), transpose);
+            sum = coopMatMulAdd(a, b, sum);
+        }
+        barrier();
+    }
+
+    coopMatPerElementNV(sum, sum, scale_output, token, count);
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> outputs =
+        createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    outputs = setTensorLayoutDimensionNV(outputs, count, shape.rows);
+    outputs = setTensorLayoutStrideNV(outputs, shape.stride, 1);
+    coopMatStoreTensorNV(sum, output_data.values, shape.offset,
+        sliceTensorLayoutNV(outputs, int(token), TOKENS, int(row), ROWS), transpose);
+}

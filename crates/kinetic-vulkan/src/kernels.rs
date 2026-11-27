@@ -53,6 +53,8 @@ pub struct Kernels {
     #[cfg(not(metal_driver))]
     pub(crate) mm_q8_0_packed_narrow: Option<Rc<Kernel>>,
     #[cfg(not(metal_driver))]
+    pub(crate) mm_q8_0_cm2: Option<Rc<Kernel>>,
+    #[cfg(not(metal_driver))]
     pub(crate) mm_pack: Option<Rc<Kernel>>,
     pub(crate) quantize_q8: Rc<Kernel>,
     pub(crate) norm: Rc<Kernel>,
@@ -183,6 +185,17 @@ impl Kernels {
             mm_q8_0_packed_narrow: matrix
                 .then(|| gemv("mm_q8_0_packed_narrow", spirv!("mm_q8_0_packed_narrow")))
                 .transpose()?,
+            #[cfg(not(metal_driver))]
+            // Keep the KHR pipeline available if the optional NV one cannot be created.
+            mm_q8_0_cm2: if matrix && device.matrix2() {
+                gemv(
+                    "mm_q8_0_cm2",
+                    include_bytes!("../shaders/mm_q8_0_cm2.spv"),
+                )
+                .ok()
+            } else {
+                None
+            },
             #[cfg(not(metal_driver))]
             mm_pack: matrix
                 .then(|| Kernel::new(device, "mm_pack", spirv!("mm_pack"), 5, 1))

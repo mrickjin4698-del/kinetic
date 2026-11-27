@@ -2,6 +2,7 @@ use std::rc::Rc;
 
 use ash::vk;
 
+use crate::cooperative_matrix2;
 use crate::error::{Check, Error, Result};
 use crate::info::DeviceInfo;
 use crate::physical::PhysicalDevice;
@@ -55,6 +56,7 @@ impl Device {
             .uniform_and_storage_buffer16_bit_access(matrix);
         let mut coop =
             vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
+        let mut cm2 = cooperative_matrix2::Features::new(true);
         let mut info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queues)
             .push_next(&mut features13)
@@ -63,6 +65,10 @@ impl Device {
         if matrix {
             extensions.push(ash::khr::cooperative_matrix::NAME.as_ptr());
             info = info.push_next(&mut coop);
+        }
+        if physical.matrix2 {
+            extensions.push(cooperative_matrix2::NAME.as_ptr());
+            info = info.push_next(&mut cm2);
         }
         let info = info.enabled_extension_names(&extensions);
         let instance = &physical.instance.raw;
@@ -100,6 +106,10 @@ impl Device {
 
     pub fn info(&self) -> &DeviceInfo {
         self.physical.info()
+    }
+
+    pub(crate) fn matrix2(&self) -> bool {
+        self.physical.matrix2
     }
 
     /// Allocates a primary command buffer and begins recording it; it can

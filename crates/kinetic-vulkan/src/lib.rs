@@ -63,6 +63,8 @@ mod short_conv;
 #[cfg(not(metal_driver))]
 mod commands;
 #[cfg(not(metal_driver))]
+mod cooperative_matrix2;
+#[cfg(not(metal_driver))]
 mod device;
 #[cfg(not(metal_driver))]
 mod instance;

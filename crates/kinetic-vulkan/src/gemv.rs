@@ -475,8 +475,21 @@ impl Kernels {
                 let capacity = batch.rows();
                 let (kernel, tile, input) = match prepared {
                     Some(scratch) => {
-                        let (kernel, tile) = match &self.mm_q8_0_packed_narrow {
-                            Some(narrow) if w.ty == TensorType::Q8_0 && w.rows <= 32 => {
+                        use crate::cooperative_matrix2::TILE;
+                        // The CM2 tile reuses packed inputs for Q8 projections
+                        // with a long product dimension, such as FFN down.
+                        let (kernel, tile) = match (&self.mm_q8_0_cm2, &self.mm_q8_0_packed_narrow)
+                        {
+                            (Some(cm2), _)
+                                if w.ty == TensorType::Q8_0
+                                    && w.rows.is_multiple_of(TILE.0)
+                                    && w.cols >= w.rows
+                                    && w.cols >= 2048
+                                    && capacity >= TILE.1 =>
+                            {
+                                (cm2, TILE)
+                            }
+                            (_, Some(narrow)) if w.ty == TensorType::Q8_0 && w.rows <= 32 => {
                                 (narrow, MATRIX_NARROW_TILE)
                             }
                             _ => (&kernels[2], MATRIX_WIDE_TILE),

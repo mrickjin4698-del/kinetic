@@ -465,6 +465,9 @@ fn check_matrix_pass(
 fn q8_0_matrix_pass_matches_reference() {
     check_matrix_pass(TensorType::Q8_0, 37, 2 * 256, 32, 21, false);
     check_matrix_pass(TensorType::Q8_0, 128, 3 * 256, 160, 130, false);
+    // The CM2 workgroup path takes a partial final token tile and the same
+    // power-of-two input scaling as the KHR matrix pass.
+    check_matrix_pass(TensorType::Q8_0, 128, 2048, 160, 130, true);
     // The packed narrow pass has partial weight and token tiles and must
     // match the wider unpacked pass, including tokens scaled to fit f16.
     check_matrix_pass(TensorType::Q8_0, 29, 3 * 256, 160, 130, true);
