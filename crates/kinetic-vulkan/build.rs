@@ -315,7 +315,7 @@ const THREADGROUP_BYTES: &str = "// threadgroup bytes: ";
 
 fn spirv(name: &str, module: &naga::Module, info: &naga::valid::ModuleInfo) -> Vec<u8> {
     // Vulkan 1.3 consumes SPIR-V 1.6, which has packed int8 dot products in core.
-    let options = spv::Options {
+    let mut options = spv::Options {
         lang_version: (1, 6),
         flags: spv::WriterFlags::empty(),
         emit_int_div_checks: false,
@@ -324,6 +324,11 @@ fn spirv(name: &str, module: &naga::Module, info: &naga::valid::ModuleInfo) -> V
         use_storage_input_output_16: false,
         ..spv::Options::default()
     };
+    if name == "mm_q8_0_packed" {
+        // The packed Q8 matrix pass initializes its span and scales, stages
+        // each input block, and stores each output strip before reading them.
+        options.zero_initialize_workgroup_memory = spv::ZeroInitializeWorkgroupMemoryMode::None;
+    }
     let words =
         spv::write_vec(module, info, &options, None).unwrap_or_else(|e| panic!("{name}: {e}"));
     words.iter().flat_map(|w| w.to_le_bytes()).collect()
