@@ -45,18 +45,18 @@ const KERNELS: &[(&str, &str, &[&str])] = &[
     ),
     (
         "delta_rule",
-        "const MASK_SLOTS: bool = false; const ROWS_PER_SUBGROUP: u32 = 1u;",
-        &["delta_qk_scale", "delta_rule"],
+        "const MASK_SLOTS: bool = false;",
+        &["delta_qk_scale", "delta_rule_common", "delta_rule"],
     ),
     (
         "delta_rule_masked",
-        "const MASK_SLOTS: bool = true; const ROWS_PER_SUBGROUP: u32 = 1u;",
-        &["delta_qk_scale", "delta_rule"],
+        "const MASK_SLOTS: bool = true;",
+        &["delta_qk_scale", "delta_rule_common", "delta_rule"],
     ),
     (
         "delta_rule_paired",
-        "const MASK_SLOTS: bool = true; const ROWS_PER_SUBGROUP: u32 = 2u;",
-        &["delta_qk_scale", "delta_rule"],
+        "",
+        &["delta_qk_scale", "delta_rule_common", "delta_rule_paired"],
     ),
     ("gated_norm", "", &["gated_norm", "put_q8"]),
     (

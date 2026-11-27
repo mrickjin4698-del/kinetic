@@ -637,68 +637,76 @@ fn paired_prompt_attention_matches_single_queries() {
 #[test]
 fn delta_journal_mask_matches_modulo_through_replay() {
     for gpu in gpus() {
-        let shape = DeltaShape {
-            n_k_heads: 1,
-            n_v_heads: 1,
-            head_k_dim: 128,
-            head_v_dim: 32,
-            conv_taps: 3,
-            eps: 1e-5,
-        };
-        let dev = &gpu.device;
-        let k = &gpu.kernels;
-        let rows = 4;
-        let checkpoint = 30;
-        let mut batch = Batch::new(dev, rows, 0, checkpoint + rows, 0).unwrap();
-        let masked = DeltaState::new(dev, &shape, 8).unwrap();
-        let modulo = DeltaState::new(dev, &shape, 9).unwrap();
-        let mut proj = DeviceBuffer::new(dev, rows * shape.proj_len()).unwrap();
-        let rec = DeviceBuffer::new(dev, rows * shape.value_dim()).unwrap();
-        let out = GemvInput::batch(dev, shape.value_dim(), rows).unwrap();
-        let conv =
-            DeviceBuffer::from_slice(dev, &vec![0.25; shape.channels() * shape.conv_taps]).unwrap();
-        let heads = DeviceBuffer::from_slice(dev, &[0.0, -0.05]).unwrap();
-        let norm = DeviceBuffer::from_slice(dev, &[1.0; 32]).unwrap();
-        let weights = DeltaWeights {
-            conv: &conv,
-            heads: &heads,
-            norm: &norm,
-        };
-        let record = |state| {
-            let mut c = Commands::new(dev).unwrap();
-            batch.record_upload(&mut c).unwrap();
-            k.delta_net(&batch, &shape, &proj, &weights, state, &rec, &out, &mut c)
-                .unwrap();
-            c.finish().unwrap()
-        };
-        let masked_pass = record(&masked);
-        let modulo_pass = record(&modulo);
-        let bits = |x: Vec<f32>| x.into_iter().map(f32::to_bits).collect::<Vec<_>>();
-        let mut rng = Lcg(29);
-        let mut check_pass = |pos, n, since| {
-            batch.set(n, pos, 0..0, since).unwrap();
-            let input: Vec<_> = (0..proj.len()).map(|_| rng.f32()).collect();
-            proj.copy_from(&input).unwrap();
-            masked_pass.launch().unwrap();
-            let actual = bits(rec.to_vec().unwrap());
-            modulo_pass.launch().unwrap();
-            assert_eq!(actual, bits(rec.to_vec().unwrap()), "position {pos}");
-        };
-        for pos in (0..checkpoint).step_by(rows) {
-            check_pass(pos, rows.min(checkpoint - pos), None);
-        }
-        for pos in [checkpoint, checkpoint + 2] {
-            check_pass(pos, 2, Some(checkpoint));
-        }
-        batch.set_replay(checkpoint, checkpoint + 3).unwrap();
-        for state in [&masked, &modulo] {
-            let mut c = Commands::new(dev).unwrap();
-            batch.record_upload(&mut c).unwrap();
-            k.delta_replay(&batch, &shape, state, &rec, &mut c).unwrap();
-            c.submit().unwrap();
-        }
-        assert_eq!(bits(masked.save().unwrap()), bits(modulo.save().unwrap()));
+        check_delta_journal_mask(&gpu, 4, 8, 30, 2);
+        // Prepared prompt passes use the paired rule for power-of-two journal
+        // sizes. The drafts wrap the journal and span a partial tile.
+        check_delta_journal_mask(&gpu, 128, 128, 126, 7);
     }
+}
+
+fn check_delta_journal_mask(gpu: &Gpu, rows: usize, slots: usize, checkpoint: usize, draft: usize) {
+    let shape = DeltaShape {
+        n_k_heads: 2,
+        n_v_heads: 3,
+        head_k_dim: 128,
+        head_v_dim: 32,
+        conv_taps: 3,
+        eps: 1e-5,
+    };
+    let dev = &gpu.device;
+    let k = &gpu.kernels;
+    let mut batch = Batch::new(dev, rows, 0, checkpoint + rows, 0).unwrap();
+    let masked = DeltaState::new(dev, &shape, slots).unwrap();
+    let modulo = DeltaState::new(dev, &shape, slots + 1).unwrap();
+    let mut proj = DeviceBuffer::new(dev, rows * shape.proj_len()).unwrap();
+    let rec = DeviceBuffer::new(dev, rows * shape.value_dim()).unwrap();
+    let out = GemvInput::batch(dev, shape.value_dim(), rows).unwrap();
+    let conv =
+        DeviceBuffer::from_slice(dev, &vec![0.25; shape.channels() * shape.conv_taps]).unwrap();
+    let heads = DeviceBuffer::from_slice(dev, &[0.0, 0.1, 0.2, -0.05, -0.11, -0.13]).unwrap();
+    let norm = DeviceBuffer::from_slice(dev, &[1.0; 32]).unwrap();
+    let weights = DeltaWeights {
+        conv: &conv,
+        heads: &heads,
+        norm: &norm,
+    };
+    let record = |state| {
+        let mut c = Commands::new(dev).unwrap();
+        c.set_prompt(true);
+        batch.record_upload(&mut c).unwrap();
+        k.delta_net(&batch, &shape, &proj, &weights, state, &rec, &out, &mut c)
+            .unwrap();
+        c.finish().unwrap()
+    };
+    let masked_pass = record(&masked);
+    let modulo_pass = record(&modulo);
+    let bits = |x: Vec<f32>| x.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+    let mut rng = Lcg(29);
+    let mut check_pass = |pos, n, since| {
+        batch.set(n, pos, 0..0, since).unwrap();
+        let input: Vec<_> = (0..proj.len()).map(|_| rng.f32()).collect();
+        proj.copy_from(&input).unwrap();
+        masked_pass.launch().unwrap();
+        let actual = bits(rec.to_vec().unwrap());
+        modulo_pass.launch().unwrap();
+        assert_eq!(actual, bits(rec.to_vec().unwrap()), "position {pos}");
+    };
+    for pos in (0..checkpoint).step_by(rows) {
+        check_pass(pos, rows.min(checkpoint - pos), None);
+    }
+    for pos in [checkpoint, checkpoint + draft] {
+        check_pass(pos, draft, Some(checkpoint));
+    }
+    batch
+        .set_replay(checkpoint, checkpoint + draft + 1)
+        .unwrap();
+    for state in [&masked, &modulo] {
+        let mut c = Commands::new(dev).unwrap();
+        batch.record_upload(&mut c).unwrap();
+        k.delta_replay(&batch, &shape, state, &rec, &mut c).unwrap();
+        c.submit().unwrap();
+    }
+    assert_eq!(bits(masked.save().unwrap()), bits(modulo.save().unwrap()));
 }
 
 #[test]
