@@ -120,6 +120,16 @@ impl VulkanLayer {
         }
     }
 
+    /// Query heads that can use split packed attention.
+    pub fn split_kv_heads(&self) -> usize {
+        match &self.mixer {
+            VulkanMixer::Attention(a) if a.shape.head_dim == 256 && a.shape.window.is_none() => {
+                a.shape.n_head
+            }
+            _ => 0,
+        }
+    }
+
     /// Whether a rollback must replay the layer's kept tokens.
     pub fn replays(&self) -> bool {
         matches!(self.mixer, VulkanMixer::DeltaNet(_))

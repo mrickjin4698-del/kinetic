@@ -6,7 +6,7 @@ use crate::commands::Commands;
 use crate::device::Device;
 use crate::error::{Error, Result};
 use crate::gemv::GemvInput;
-use crate::kernels::Kernels;
+use crate::kernels::{Kernels, MAX_GROUPS};
 use crate::memory::DeviceBuffer;
 
 /// How an attention layer gates its output.
@@ -86,6 +86,31 @@ impl AttentionShape {
         } else {
             Err(Error::Shape(format!("attention of shape {self:?}")))
         }
+    }
+}
+
+const KV_SPLITS: usize = 4;
+
+/// Device storage for the four partials of each head in packed 256-wide attention.
+pub struct SplitKvScratch(DeviceBuffer<f32>);
+
+impl SplitKvScratch {
+    fn words(rows: usize, heads: usize) -> Option<usize> {
+        rows.checked_mul(heads)?
+            .checked_mul(KV_SPLITS * (256 + 2))
+            .filter(|&n| n != 0 && u32::try_from(n).is_ok())
+    }
+
+    /// Holds the partials for up to `rows` queries of `heads` heads each.
+    pub fn new(device: &Rc<Device>, rows: usize, heads: usize) -> Result<Self> {
+        let words = Self::words(rows, heads)
+            .ok_or_else(|| Error::Shape("split attention scratch size".into()))?;
+        Ok(Self(DeviceBuffer::new(device, words)?))
+    }
+
+    /// Device bytes held.
+    pub fn size_bytes(&self) -> usize {
+        self.0.len() * size_of::<f32>()
     }
 }
 
@@ -447,6 +472,55 @@ impl Kernels {
                     .map_or((single, 1, 1), |k| (k, 2, 1)),
             };
             let [ox, oq, od] = out.outputs();
+            let constants = [
+                shape.n_head as u32,
+                shape.n_head_kv as u32,
+                shape.qkv_len() as u32,
+                shape.q_head_len() as u32,
+                shape.scale.to_bits(),
+                gate,
+                shape.gate_at() as u32,
+                shape.window.map_or(u32::MAX, |w| w as u32),
+                cache.slots as u32,
+            ];
+            let split = commands
+                .split_kv()
+                .filter(|scratch| {
+                    packed
+                        && hd == 256
+                        && shape.window.is_none()
+                        && shape.n_head <= MAX_GROUPS as usize / KV_SPLITS
+                        && !commands.prompt()
+                        && SplitKvScratch::words(rows, shape.n_head)
+                            .is_some_and(|words| scratch.0.len() >= words)
+                })
+                .cloned();
+            if let Some((scratch, [scan, merge])) = split.zip(self.attend_256_split.as_ref()) {
+                let common = [
+                    batch_words,
+                    qkv.allocation(),
+                    cache.data.allocation(),
+                    scratch.0.allocation(),
+                ];
+                let grid = [shape.n_head as u32, rows as u32, 1];
+                // SAFETY: shapes, outputs and scratch cover the recorded batch.
+                // The scan writes disjoint partials and the merge reads them in order.
+                unsafe {
+                    commands.dispatch(
+                        scan,
+                        &common,
+                        &constants,
+                        [grid[0] * KV_SPLITS as u32, grid[1], 1],
+                    );
+                    commands.dispatch(
+                        merge,
+                        &[common[0], common[1], common[2], common[3], ox, oq, od],
+                        &constants,
+                        grid,
+                    );
+                }
+                return Ok(());
+            }
             // SAFETY: matches attend.wgsl. The batch reads from the checked
             // cache and writes each head into its checked output row.
             unsafe {
@@ -461,17 +535,7 @@ impl Kernels {
                         oq,
                         od,
                     ],
-                    &[
-                        shape.n_head as u32,
-                        shape.n_head_kv as u32,
-                        shape.qkv_len() as u32,
-                        shape.q_head_len() as u32,
-                        shape.scale.to_bits(),
-                        gate,
-                        shape.gate_at() as u32,
-                        shape.window.map_or(u32::MAX, |w| w as u32),
-                        cache.slots as u32,
-                    ],
+                    &constants,
                     [
                         (shape.n_head / heads) as u32,
                         rows.div_ceil(tokens) as u32,

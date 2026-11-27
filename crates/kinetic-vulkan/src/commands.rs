@@ -2,6 +2,7 @@ use std::rc::Rc;
 
 use ash::vk;
 
+use crate::attention::SplitKvScratch;
 use crate::device::Device;
 use crate::error::{Check, Error, Result};
 use crate::memory::Allocation;
@@ -26,6 +27,7 @@ pub struct Commands {
     /// was recorded, after which the group's commands need no barrier.
     group: Option<bool>,
     prompt: bool,
+    split_kv: Option<Rc<SplitKvScratch>>,
 }
 
 /// A timestamp recorded in a [`Commands`] list.
@@ -56,6 +58,7 @@ impl Commands {
             buffers: Vec::new(),
             group: None,
             prompt: false,
+            split_kv: None,
         };
         if device.info().features.timestamps {
             let info = vk::QueryPoolCreateInfo::default()
@@ -80,6 +83,21 @@ impl Commands {
     /// This driver has none.
     pub fn set_prompt(&mut self, prompt: bool) {
         self.prompt = prompt;
+    }
+
+    /// Uses separate workgroups for the four partials of packed attention,
+    /// when the scratch fits the batch. Successive layers reuse the scratch.
+    pub fn set_split_kv(&mut self, scratch: Rc<SplitKvScratch>) {
+        self.split_kv = Some(scratch);
+    }
+
+    pub(crate) fn split_kv(&self) -> Option<&Rc<SplitKvScratch>> {
+        // The merge must wait for the scan even when the caller can group
+        // its other commands independently.
+        if self.group.is_some() {
+            return None;
+        }
+        self.split_kv.as_ref()
     }
 
     /// See [`Commands::set_prompt`].

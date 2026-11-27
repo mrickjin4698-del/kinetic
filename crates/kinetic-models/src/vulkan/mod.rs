@@ -33,7 +33,7 @@ use std::rc::Rc;
 use kinetic_quant::{dequantize_row, Matrix};
 use kinetic_vulkan::{
     Batch, Commands, Device, DeviceBuffer, DeviceMatrix, Graph, Instance, Kernels, Out,
-    PhysicalDevice, Rows,
+    PhysicalDevice, Rows, SplitKvScratch,
 };
 
 use crate::model::{embed_into, Mark};
@@ -58,6 +58,9 @@ const PROMPT_MIN: usize = 4;
 /// that would leave most of a full pass's rows idle: every kernel of a
 /// pass runs its full rows, those past its tokens returning at once.
 const PROMPT_SHORT: usize = 64;
+
+/// Prefer separate workgroups when a single decoded token scans a long cache.
+const SPLIT_KV_MIN_CONTEXT: usize = 4096;
 
 /// The device and its kernels.
 struct Gpu {
@@ -134,6 +137,8 @@ pub struct VulkanState {
     /// [`VulkanModel::set_prompt`].
     prompt: bool,
     decode: Pass,
+    /// Alternate recordings of the decoder using its same work buffers.
+    split_decode: Option<SplitDecode>,
     layers: Vec<LayerState>,
     /// Prompt passes, which the device may run with kernels written for
     /// many tokens at once, by rows, fewest first; none where it has no
@@ -156,6 +161,12 @@ impl VulkanState {
     pub fn is_empty(&self) -> bool {
         self.pos == 0
     }
+}
+
+struct SplitDecode {
+    greedy: Graph,
+    logits: Graph,
+    scratch_bytes: usize,
 }
 
 /// A pass's buffers and recordings for its possible outputs.
@@ -377,6 +388,7 @@ impl<'m> VulkanModel<'m> {
             false => None,
         };
         let decode = self.record_pass(work, &layers, None)?;
+        let split_decode = self.record_split_decode(&decode.work, &layers)?;
         // A prompt pass wants the logits of its last token at most.
         let mut sizes = vec![self.prompt_batch];
         if self.prompt_batch > PROMPT_SHORT {
@@ -394,6 +406,7 @@ impl<'m> VulkanModel<'m> {
             checkpoint: None,
             prompt: false,
             decode,
+            split_decode,
             prompt_passes,
             replay,
             layers,
@@ -421,7 +434,47 @@ impl<'m> VulkanModel<'m> {
             .iter()
             .map(|p| p.work.size_bytes())
             .sum();
-        state.decode.work.size_bytes() + prompt + layers
+        let split = state
+            .split_decode
+            .as_ref()
+            .map_or(0, |pass| pass.scratch_bytes);
+        state.decode.work.size_bytes() + prompt + layers + split
+    }
+
+    fn record_split_decode(
+        &self,
+        w: &Work,
+        states: &[LayerState],
+    ) -> kinetic_vulkan::Result<Option<SplitDecode>> {
+        if self.context < SPLIT_KV_MIN_CONTEXT || !self.matrix {
+            return Ok(None);
+        }
+        let heads = self
+            .layers
+            .iter()
+            .map(VulkanLayer::split_kv_heads)
+            .max()
+            .unwrap_or(0);
+        if heads == 0 {
+            return Ok(None);
+        }
+        let record = || -> kinetic_vulkan::Result<SplitDecode> {
+            let scratch = Rc::new(SplitKvScratch::new(
+                &self.gpu.device,
+                w.batch.rows(),
+                heads,
+            )?);
+            Ok(SplitDecode {
+                greedy: self.record(w, states, Head::Greedy, false, false, Some(&scratch))?,
+                logits: self.record(w, states, Head::Logits, false, false, Some(&scratch))?,
+                scratch_bytes: scratch.size_bytes(),
+            })
+        };
+        match record() {
+            Ok(pass) => Ok(Some(pass)),
+            Err(error) if error.out_of_memory() => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     fn record_pass(
@@ -480,12 +533,12 @@ impl<'m> VulkanModel<'m> {
         self.record_head(scored, Head::Logits, &mut last_logits)?;
         last_logits.download(&scored.logits, 0, &work.logits_host, 0, self.n_vocab())?;
         Ok(Pass {
-            state: self.record(&work, states, Head::None, prompt, defer_queries)?,
+            state: self.record(&work, states, Head::None, prompt, defer_queries, None)?,
             hidden: hidden.finish()?,
             last_logits: last_logits.finish()?,
             last_uses_decode: head_decode.is_some(),
-            greedy: self.record(&work, states, Head::Greedy, prompt, false)?,
-            logits: self.record(&work, states, Head::Logits, prompt, false)?,
+            greedy: self.record(&work, states, Head::Greedy, prompt, false, None)?,
+            logits: self.record(&work, states, Head::Logits, prompt, false, None)?,
             logits_tail: (1..work.batch.head_rows()).map(|_| None).collect(),
             work,
         })
@@ -499,10 +552,14 @@ impl<'m> VulkanModel<'m> {
         head: Head,
         prompt: bool,
         defer_queries: bool,
+        split: Option<&Rc<SplitKvScratch>>,
     ) -> kinetic_vulkan::Result<Graph> {
         let (k, d) = (&self.gpu.kernels, self.n_embd);
         let mut c = Commands::new(&self.gpu.device)?;
         c.set_prompt(prompt);
+        if let Some(scratch) = split {
+            c.set_split_kv(Rc::clone(scratch));
+        }
         let rows = w.batch.rows();
         c.independent(|c| {
             w.batch.record_upload(c)?;
@@ -752,19 +809,35 @@ impl<'m> VulkanModel<'m> {
             self.ropes.fill(&mut w.batch, state.pos, n);
             let x = &mut w.embedded.as_mut_slice()[..n * d];
             embed_into(&self.embd, self.embd_scale, chunk, x);
-            match (head.len(), output, read_hidden) {
-                (0, _, false) => pass.state.launch()?,
-                (0, _, true) => pass.state.launch_then(&pass.hidden)?,
-                (1, Head::Logits, false) => {
-                    if let Some(batch) = head_batch.filter(|_| pass.last_uses_decode) {
-                        let pos = state.pos + head.start;
-                        batch.set(1, pos, 0..1, None)?;
-                        self.ropes.fill(batch, pos, 1);
+            let split = state.split_decode.as_ref().filter(|_| {
+                !prompt
+                    && n == 1
+                    && head.len() == 1
+                    && state.checkpoint.is_none()
+                    && state.pos + 1 >= SPLIT_KV_MIN_CONTEXT
+            });
+            let split_graph = split.and_then(|pass| match output {
+                Head::Greedy => Some(&pass.greedy),
+                Head::Logits => Some(&pass.logits),
+                Head::None => None,
+            });
+            if let Some(graph) = split_graph {
+                graph.launch()?;
+            } else {
+                match (head.len(), output, read_hidden) {
+                    (0, _, false) => pass.state.launch()?,
+                    (0, _, true) => pass.state.launch_then(&pass.hidden)?,
+                    (1, Head::Logits, false) => {
+                        if let Some(batch) = head_batch.filter(|_| pass.last_uses_decode) {
+                            let pos = state.pos + head.start;
+                            batch.set(1, pos, 0..1, None)?;
+                            self.ropes.fill(batch, pos, 1);
+                        }
+                        pass.state.launch_then(&pass.last_logits)?;
                     }
-                    pass.state.launch_then(&pass.last_logits)?;
+                    (rows, Head::Logits, _) => pass.launch_logits(&self.gpu.device, vocab, rows)?,
+                    _ => pass.greedy.launch()?,
                 }
-                (rows, Head::Logits, _) => pass.launch_logits(&self.gpu.device, vocab, rows)?,
-                _ => pass.greedy.launch()?,
             }
 
             let w = &pass.work;

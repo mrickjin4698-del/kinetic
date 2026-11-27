@@ -9,7 +9,7 @@ use kinetic_quant::{dequantize, Matrix, TensorType};
 use kinetic_vulkan::{
     AttentionGate, AttentionShape, Batch, Commands, DeltaShape, DeltaState, DeltaWeights, Device,
     DeviceBuffer, DeviceMatrix, Error, GemvInput, Instance, Kernels, KvCache, MatrixScratch, Out,
-    QkvConsts, Rows,
+    QkvConsts, Rows, SplitKvScratch,
 };
 
 struct Gpu {
@@ -603,9 +603,13 @@ fn paired_prompt_attention_matches_single_queries() {
             let mut batch = Batch::new(dev, rows, 0, positions, 0).unwrap();
             batch.set(tokens, start, 0..0, None).unwrap();
 
-            let run = |shape, prompt| {
+            let split_scratch = Rc::new(SplitKvScratch::new(dev, rows, n_head).unwrap());
+            let run = |shape, prompt, split| {
                 let mut commands = Commands::new(dev).unwrap();
                 commands.set_prompt(prompt);
+                if split {
+                    commands.set_split_kv(Rc::clone(&split_scratch));
+                }
                 batch.record_upload(&mut commands).unwrap();
                 gpu.kernels
                     .attend_prepared(&batch, shape, &qkv, &cache, &out, &mut commands)
@@ -617,10 +621,11 @@ fn paired_prompt_attention_matches_single_queries() {
                 window: Some(positions),
                 ..shape.clone()
             };
-            let single = run(&shape, false);
-            let grouped = run(&window, true);
-            let paired = run(&shape, true);
-            for (kind, got) in [("grouped", grouped), ("paired", paired)] {
+            let single = run(&shape, false, false);
+            let grouped = run(&window, true, false);
+            let paired = run(&shape, true, false);
+            let split = run(&shape, false, true);
+            for (kind, got) in [("grouped", grouped), ("paired", paired), ("split", split)] {
                 for (i, (&a, b)) in single.iter().zip(got).enumerate() {
                     assert!(a.is_finite());
                     assert_eq!(

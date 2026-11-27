@@ -9,6 +9,7 @@ use objc2_metal::{
     MTLComputeCommandEncoder, MTLSize,
 };
 
+use crate::attention::SplitKvScratch;
 use crate::device::Device;
 use crate::error::{Error, Result};
 use crate::memory::Allocation;
@@ -78,6 +79,13 @@ impl Commands {
     /// tokens at once, which give every token the bits it gets alone.
     pub fn set_prompt(&mut self, prompt: bool) {
         self.prompt = prompt;
+    }
+
+    /// Supplies scratch for split packed attention. Metal uses planar caches.
+    pub fn set_split_kv(&mut self, _scratch: Rc<SplitKvScratch>) {}
+
+    pub(crate) fn split_kv(&self) -> Option<&Rc<SplitKvScratch>> {
+        None
     }
 
     /// See [`Commands::set_prompt`].
