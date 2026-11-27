@@ -7,6 +7,7 @@
 
 use kinetic_gguf::GgufFile;
 use kinetic_models::cuda::{CudaModel, CudaState, Placement, Run};
+use kinetic_models::speculative::Target;
 
 const PROMPT: [u32; 12] = [1, 400, 1000, 23, 5000, 77, 901, 12, 3333, 600, 45, 2024];
 const NEXT: [u32; 6] = [300, 3000, 30, 7, 777, 90];
@@ -57,6 +58,7 @@ fn batches_and_rollbacks_change_no_bit() {
     // last device while the first goes on with the next pass.
     let single = CudaModel::load(&model, LONG + 8).unwrap();
     let whole_long = long_prompt(&single);
+    state_only_prompt_preserves_logits(&single);
     drop(single);
     for devices in [vec![0, 0], vec![0, 1]]
         .into_iter()
@@ -104,6 +106,24 @@ fn long_prompt(gpu: &CudaModel) -> (Vec<u32>, Vec<u32>) {
     let mut state = gpu.new_state().unwrap();
     let out = gpu.run(&mut state, &tokens, false).unwrap();
     (bits(&out.hidden), bits(&out.logits))
+}
+
+/// A state-only prefix leaves later steps with the same logits and hidden rows.
+fn state_only_prompt_preserves_logits(gpu: &CudaModel) {
+    let prompt: Vec<u32> = (0..LONG).map(|i| (i * 7919 % 4000 + 10) as u32).collect();
+    let mut full = gpu.new_state().unwrap();
+    let mut prefix = gpu.new_state().unwrap();
+    // Record a decode step before borrowing the wide prefill scratch.
+    gpu.run_greedy(&mut full, &[1], false).unwrap();
+    gpu.run_greedy(&mut prefix, &[1], false).unwrap();
+    gpu.run_greedy(&mut full, &prompt, false).unwrap();
+    gpu.advance_state(&mut prefix, &prompt);
+    for step in NEXT.chunks(1) {
+        let expected = gpu.run(&mut full, step, false).unwrap();
+        let actual = gpu.run(&mut prefix, step, false).unwrap();
+        assert_eq!(bits(&actual.logits), bits(&expected.logits));
+        assert_eq!(bits(&actual.hidden), bits(&expected.hidden));
+    }
 }
 
 /// The prediction block's output over the prompt, each position's hidden

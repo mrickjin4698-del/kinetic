@@ -360,6 +360,21 @@ impl CudaLayer {
         self.back(gpu, s, n, next)
     }
 
+    /// Updates the final layer's state for a leading prompt batch.
+    pub fn advance_state(
+        &self,
+        gpu: &Gpu,
+        s: &mut Scratch,
+        state: &mut LayerState,
+        flow: Flow,
+        batch: &Batch,
+    ) -> kinetic_cuda::Result<()> {
+        match (&self.mixer, state) {
+            (CudaMixer::Attention(a), LayerState::Attention(c)) => a.update_cache(gpu, s, c, batch),
+            (mixer, state) => mixer.forward(gpu, s, state, flow, batch),
+        }
+    }
+
     /// Runs the mixer and the (shared) feed-forward: leaves the feed-forward
     /// input in `s.h` and its output in `s.y`.
     pub fn front(

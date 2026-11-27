@@ -453,6 +453,30 @@ impl Kernels {
         batch: &Batch,
         stream: &Stream,
     ) -> Result<()> {
+        self.queue_attention(params, io, cache, batch, stream, false)
+    }
+
+    /// Applies the key and value transforms and writes them to `cache`.
+    pub fn store_attention_kv(
+        &self,
+        params: AttentionParams,
+        io: AttentionIo,
+        cache: &mut KvCache,
+        batch: &Batch,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.queue_attention(params, io, cache, batch, stream, true)
+    }
+
+    fn queue_attention(
+        &self,
+        params: AttentionParams,
+        io: AttentionIo,
+        cache: &mut KvCache,
+        batch: &Batch,
+        stream: &Stream,
+        store_only: bool,
+    ) -> Result<()> {
         let s = params.shape;
         s.check()?;
         let n = batch.len();
@@ -475,7 +499,8 @@ impl Kernels {
         );
         let biased = params.q_bias.is_some() || params.k_bias.is_some() || params.v_bias.is_some();
         let bias_fits = |b: Option<&DeviceBuffer<f32>>, len| b.is_none_or(|b| b.len() == len);
-        if cache.kv_dim != kv_dim
+        if (store_only && !params.store)
+            || cache.kv_dim != kv_dim
             || io.out.width() != width
             || q_rows.is_none()
             || k_rows.is_none()
@@ -521,6 +546,8 @@ impl Kernels {
         }
         io.out.check_rows(n)?;
 
+        // With zero query heads, attn_prepare runs only its K/V blocks.
+        let heads = if store_only { 0 } else { s.n_head as u32 };
         let max_chunks = s.max_chunks(cache.slots);
         let ((k_cache, k_scale), (v_cache, v_scale)) = (cache.k.ptrs(), cache.v.ptrs());
         let mut args = AttnArgs {
@@ -538,7 +565,7 @@ impl Kernels {
             out: io.out.act(),
             q_stride: s.q_len() as u32,
             q_head_stride: s.q_head_stride() as u32,
-            n_head: s.n_head as u32,
+            n_head: heads,
             n_head_kv: s.n_head_kv as u32,
             head_dim: hd as u32,
             rope_dims: s.rope_dims as u32,
@@ -551,7 +578,7 @@ impl Kernels {
             interleaved_gate: s.interleaved_gate.into(),
             rope_adjacent: s.rope_adjacent.into(),
             norm_after_rope: s.norm_after_rope.into(),
-            q_norm_rows: q_rows.is_some_and(|r| r).into(),
+            q_norm_rows: (!store_only && q_rows.is_some_and(|r| r)).into(),
             k_norm_rows: k_rows.is_some_and(|r| r).into(),
             rope_mscale: s.rope_mscale,
             q_bias: ptr(params.q_bias),
@@ -562,7 +589,7 @@ impl Kernels {
             grid: batch.grid_ptr(),
             v_norm: s.v_norm.into(),
         };
-        let (n, heads) = (n as u32, s.n_head as u32);
+        let n = n as u32;
         let grid = |grid: [u32; 3], threads: u32| LaunchConfig {
             grid,
             block: [threads, 1, 1],
@@ -588,6 +615,9 @@ impl Kernels {
                 stream,
                 &args,
             )?;
+            if store_only {
+                return Ok(());
+            }
             if flash {
                 let config = LaunchConfig {
                     grid: [

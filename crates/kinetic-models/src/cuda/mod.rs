@@ -775,8 +775,20 @@ impl<'m> CudaModel<'m> {
         all_rows: bool,
         logits: bool,
     ) -> kinetic_cuda::Result<Output> {
-        let Some(spare) = self.spare.as_ref().filter(|_| tokens.len() > MAX_BATCH) else {
-            return self.forward_rows(state, tokens, all_rows, logits);
+        self.with_prefill_work(state, tokens.len(), |state| {
+            self.forward_rows(state, tokens, all_rows, logits)
+        })
+    }
+
+    /// Lends the wide scratch to one sequence for prefill.
+    fn with_prefill_work<R>(
+        &self,
+        state: &mut CudaState,
+        len: usize,
+        run: impl FnOnce(&mut CudaState) -> R,
+    ) -> R {
+        let Some(spare) = self.spare.as_ref().filter(|_| len > MAX_BATCH) else {
+            return run(state);
         };
         let mut spare = spare.borrow_mut();
         // the decode graph reads the state's own buffers
@@ -784,19 +796,45 @@ impl<'m> CudaModel<'m> {
         let shift = state.work.batch.grid_shift();
         spare.swap(&mut state.work);
         state.work.batch.set_grid_shift(shift);
-        let out = self.forward_rows(state, tokens, all_rows, logits);
+        let out = run(state);
         spare.swap(&mut state.work);
         state.step = step;
         out
     }
 
-    fn forward_rows(
+    /// Advances a leading prompt on a single GPU without reading outputs.
+    /// Returns false when the sequence needs the regular forward path.
+    fn advance_prompt_state(
         &self,
         state: &mut CudaState,
         tokens: &[u32],
-        all_rows: bool,
-        logits: bool,
-    ) -> kinetic_cuda::Result<Output> {
+    ) -> kinetic_cuda::Result<bool> {
+        if tokens.len() <= MAX_BATCH
+            || self.front != 0
+            || !self.shards.is_empty()
+            || self.offload.is_some()
+            || state.checkpoint.is_some()
+        {
+            return Ok(false);
+        }
+        self.check_forward(state, tokens)?;
+        self.with_prefill_work(state, tokens.len(), |state| {
+            for chunk in batches(tokens, state.pos, true, self.batch_rows()) {
+                state.work.batch.set(state.pos, chunk, &self.gpu.stream)?;
+                self.embed(&mut state.work, chunk)?;
+                self.queue_main(&mut state.work, Flow::Commit, true)?;
+                self.gpu.stream.synchronize()?;
+                state.pos += chunk.len();
+            }
+            Ok(true)
+        })
+    }
+
+    fn check_forward(
+        &self,
+        state: &CudaState,
+        tokens: &[u32],
+    ) -> kinetic_cuda::Result<Option<usize>> {
         self.check_tokens(tokens)?;
         if state.pos + tokens.len() > self.context {
             return Err(shape(format!(
@@ -812,6 +850,17 @@ impl<'m> CudaModel<'m> {
             )));
         }
 
+        Ok(since)
+    }
+
+    fn forward_rows(
+        &self,
+        state: &mut CudaState,
+        tokens: &[u32],
+        all_rows: bool,
+        logits: bool,
+    ) -> kinetic_cuda::Result<Output> {
+        let since = self.check_forward(state, tokens)?;
         let d = self.n_embd;
         let mut out = Output {
             greedy: Vec::new(),
@@ -889,7 +938,7 @@ impl<'m> CudaModel<'m> {
                 // The rows go to the host from the last shard, and the main
                 // device moves on to the next pass.
                 self.embed(&mut state.work, chunk)?;
-                self.queue_main(&mut state.work, flow)?;
+                self.queue_main(&mut state.work, flow, false)?;
                 for k in 0..self.shards.len() {
                     self.hand_to_shard(&mut state.work, k)?;
                     self.queue_shard(&mut state.work, k, flow)?;
@@ -973,7 +1022,7 @@ impl<'m> CudaModel<'m> {
             if embed_on_device {
                 self.embed(work, token)?;
             }
-            self.queue_main(work, Flow::Commit)
+            self.queue_main(work, Flow::Commit, false)
         })?];
         for (k, shard) in self.shards.iter().enumerate() {
             // queued now, outside the graph, so the shard's batch holds this
@@ -1092,7 +1141,7 @@ impl<'m> CudaModel<'m> {
     /// the scratch: those of the main device, then those of each shard, the
     /// stream handed from device to device and its norm back for the head.
     fn queue_layers(&self, work: &mut Work, flow: Flow) -> kinetic_cuda::Result<()> {
-        self.queue_main(work, flow)?;
+        self.queue_main(work, flow, false)?;
         for k in 0..self.shards.len() {
             self.hand_to_shard(work, k)?;
             self.queue_shard(work, k, flow)?;
@@ -1101,7 +1150,12 @@ impl<'m> CudaModel<'m> {
     }
 
     /// Queues the main device's layers over the batch in `work`.
-    fn queue_main(&self, work: &mut Work, flow: Flow) -> kinetic_cuda::Result<()> {
+    fn queue_main(
+        &self,
+        work: &mut Work,
+        flow: Flow,
+        state_only: bool,
+    ) -> kinetic_cuda::Result<()> {
         let n = work.batch.len();
         let s = &mut work.scratch;
         if let Some(p) = &self.per_layer {
@@ -1112,7 +1166,7 @@ impl<'m> CudaModel<'m> {
             Some(next) => next.entry_norm.as_ref(),
             None => Some(&self.output_norm),
         };
-        self.queue_run(&self.gpu, &self.layers, work, flow, last)
+        self.queue_run(&self.gpu, &self.layers, work, flow, last, state_only)
     }
 
     /// Queues the copies of the batch, the stream and its norm from the
@@ -1142,7 +1196,14 @@ impl<'m> CudaModel<'m> {
             Some(next) => next.entry_norm.as_ref(),
             None => Some(&shard.output_norm),
         };
-        self.queue_run(&shard.gpu, &shard.layers, &mut work.shards[k], flow, last)
+        self.queue_run(
+            &shard.gpu,
+            &shard.layers,
+            &mut work.shards[k],
+            flow,
+            last,
+            false,
+        )
     }
 
     /// Queues the copy of the last shard's normalized stream back to the
@@ -1160,7 +1221,8 @@ impl<'m> CudaModel<'m> {
     }
 
     /// Queues `layers` on `gpu` over the batch in `work`, whose `h` holds
-    /// the input of the first, normalized; the last applies `last` after.
+    /// the input of the first, normalized. The last layer either applies
+    /// `last` afterward or stops once it has written its state.
     fn queue_run(
         &self,
         gpu: &Gpu,
@@ -1168,13 +1230,19 @@ impl<'m> CudaModel<'m> {
         work: &mut Work,
         flow: Flow,
         last: Option<&DeviceBuffer<f32>>,
+        state_only: bool,
     ) -> kinetic_cuda::Result<()> {
         let s = &mut work.scratch;
         let mut offload = self.offload.as_ref().map(RefCell::borrow_mut);
         let mut moe_layer = 0;
         for (i, layer) in layers.iter().enumerate() {
+            if let Some(from) = layer.kv_source {
+                copy_lent(gpu, &mut work.layers, from, i, &work.batch)?;
+            }
+            let state = &mut work.layers[i];
             let next = match layers.get(i + 1) {
                 Some(l) => l.mixer_norm.as_ref(),
+                None if state_only => return layer.advance_state(gpu, s, state, flow, &work.batch),
                 None => last,
             };
             let routed = match (offload.as_deref_mut(), work.experts.as_mut()) {
@@ -1188,10 +1256,6 @@ impl<'m> CudaModel<'m> {
                 }
                 _ => None,
             };
-            if let Some(from) = layer.kv_source {
-                copy_lent(gpu, &mut work.layers, from, i, &work.batch)?;
-            }
-            let state = &mut work.layers[i];
             layer.forward(gpu, s, state, flow, &work.batch, next, routed)?;
         }
         Ok(())

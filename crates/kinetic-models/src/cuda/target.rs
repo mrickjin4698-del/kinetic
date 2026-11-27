@@ -1,3 +1,4 @@
+use super::lanes::JobOutput;
 use super::{CudaModel, CudaMtpState, CudaState};
 use crate::speculative::{Predictor, Target};
 
@@ -19,8 +20,19 @@ impl Target for CudaModel<'_> {
     }
 
     fn score(&self, state: &mut CudaState, tokens: &[u32], all_rows: bool) -> (Vec<u32>, Vec<f32>) {
-        let ran = self.run_seated(state, tokens, all_rows, false);
+        let ran = self.run_seated(
+            state,
+            tokens,
+            JobOutput::Forward {
+                all_rows,
+                logits: false,
+            },
+        );
         (ran.greedy, ran.forward.hidden)
+    }
+
+    fn advance_state(&self, state: &mut CudaState, tokens: &[u32]) {
+        self.run_seated(state, tokens, JobOutput::State);
     }
 
     fn logits(
@@ -29,7 +41,14 @@ impl Target for CudaModel<'_> {
         tokens: &[u32],
         all_rows: bool,
     ) -> (Vec<f32>, Vec<f32>) {
-        let ran = self.run_seated(state, tokens, all_rows, true);
+        let ran = self.run_seated(
+            state,
+            tokens,
+            JobOutput::Forward {
+                all_rows,
+                logits: true,
+            },
+        );
         (ran.forward.logits, ran.forward.hidden)
     }
 

@@ -140,20 +140,37 @@ impl CudaAttention {
 
     /// Queues the projections of the first `n` rows of `s.h` into `s.proj`.
     pub fn project(&self, gpu: &Gpu, s: &mut Scratch, n: usize) -> kinetic_cuda::Result<()> {
+        self.project_rows(gpu, s, n, false)
+    }
+
+    fn project_rows(
+        &self,
+        gpu: &Gpu,
+        s: &mut Scratch,
+        n: usize,
+        store_only: bool,
+    ) -> kinetic_cuda::Result<()> {
         let (k, stream) = (&gpu.kernels, &gpu.stream);
         let [q, keys, values, gates] = &mut s.proj;
         let x = match &self.folding {
             Some(f) => f.fold(gpu, &s.h, &mut s.folded, n)?,
             None => &s.h,
         };
-        gpu.fork()?;
-        let side = &gpu.side;
+        let kv_stream = if store_only {
+            stream
+        } else {
+            gpu.fork()?;
+            &gpu.side
+        };
         if let (Some(km), Some(vm)) = (&self.k, &self.v) {
-            k.gemv_rows(km, km.rows(), x, 0..n, keys, side)?;
-            k.gemv_rows(vm, vm.rows(), x, 0..n, values, side)?;
+            k.gemv_rows(km, km.rows(), x, 0..n, keys, kv_stream)?;
+            k.gemv_rows(vm, vm.rows(), x, 0..n, values, kv_stream)?;
+        }
+        if store_only {
+            return Ok(());
         }
         if let Some(g) = &self.head_gate {
-            k.gemv_rows(g, g.rows(), x, 0..n, gates, side)?;
+            k.gemv_rows(g, g.rows(), x, 0..n, gates, kv_stream)?;
         }
         k.gemv_rows(&self.q, self.q.rows(), x, 0..n, q, stream)?;
         gpu.join()
@@ -167,6 +184,33 @@ impl CudaAttention {
         s: &mut Scratch,
         cache: &mut KvCache,
         batch: &Batch,
+    ) -> kinetic_cuda::Result<()> {
+        self.mix_rows(gpu, s, cache, batch, false)
+    }
+
+    /// Stores this layer's keys and values for future tokens.
+    pub fn update_cache(
+        &self,
+        gpu: &Gpu,
+        s: &mut Scratch,
+        cache: &mut KvCache,
+        batch: &Batch,
+    ) -> kinetic_cuda::Result<()> {
+        if self.k.is_none() {
+            // Its cache was filled by the lending layer.
+            return Ok(());
+        }
+        self.project_rows(gpu, s, batch.len(), true)?;
+        self.mix_rows(gpu, s, cache, batch, true)
+    }
+
+    fn mix_rows(
+        &self,
+        gpu: &Gpu,
+        s: &mut Scratch,
+        cache: &mut KvCache,
+        batch: &Batch,
+        store_only: bool,
     ) -> kinetic_cuda::Result<()> {
         let (k, stream) = (&gpu.kernels, &gpu.stream);
         let [q, keys, values, gates] = &mut s.proj;
@@ -189,7 +233,11 @@ impl CudaAttention {
             scratch: &mut s.scratch,
             out: &mut *out,
         };
-        k.attention(params, io, cache, batch, stream)
+        if store_only {
+            k.store_attention_kv(params, io, cache, batch, stream)
+        } else {
+            k.attention(params, io, cache, batch, stream)
+        }
     }
 
     /// Queues the output projection of the first `n` rows of `s.mixed`

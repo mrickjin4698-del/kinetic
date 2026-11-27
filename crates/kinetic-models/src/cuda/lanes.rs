@@ -39,8 +39,12 @@ pub(super) struct Job {
     /// Owned by a caller that waits in the convoy until the pass is done.
     state: *mut CudaState,
     tokens: Vec<u32>,
-    all_rows: bool,
-    logits: bool,
+    output: JobOutput,
+}
+
+pub(super) enum JobOutput {
+    Forward { all_rows: bool, logits: bool },
+    State,
 }
 
 /// A fresh id for a state.
@@ -72,29 +76,33 @@ impl CudaModel<'_> {
         &self,
         state: &mut CudaState,
         tokens: &[u32],
-        all_rows: bool,
-        logits: bool,
+        output: JobOutput,
     ) -> Ran {
         let job = Job {
             state,
             tokens: tokens.to_vec(),
-            all_rows,
-            logits,
+            output,
         };
         self.convoy.run(job, |jobs| {
             let mut runs: Vec<Run> = jobs
                 .iter()
-                .map(|j| Run {
-                    // SAFETY: the caller that owns the state waits in the
-                    // convoy until this pass hands its result back, and the
-                    // convoy orders this use after the caller's last one.
-                    state: unsafe { &mut *j.state },
-                    tokens: &j.tokens,
-                    all_rows: j.all_rows,
-                    logits: j.logits,
+                .map(|j| {
+                    let (all_rows, logits) = match j.output {
+                        JobOutput::Forward { all_rows, logits } => (all_rows, logits),
+                        JobOutput::State => (false, false),
+                    };
+                    Run {
+                        // SAFETY: the caller that owns the state waits in the
+                        // convoy until this pass hands its result back, and the
+                        // convoy orders this use after the caller's last one.
+                        state: unsafe { &mut *j.state },
+                        tokens: &j.tokens,
+                        all_rows,
+                        logits,
+                    }
                 })
                 .collect();
-            self.run_many(&mut runs)
+            self.run_pass(&mut runs, |i| matches!(jobs[i].output, JobOutput::State))
                 .unwrap_or_else(|e| panic!("CUDA: {e}"))
         })
     }
@@ -104,6 +112,14 @@ impl CudaModel<'_> {
     /// mixers that run one after another, up to [`MAX_BATCH`] rows a pass.
     /// The rest run alone. Every result is exactly what running alone gives.
     pub fn run_many(&self, runs: &mut [Run]) -> kinetic_cuda::Result<Vec<Ran>> {
+        self.run_pass(runs, |_| false)
+    }
+
+    fn run_pass(
+        &self,
+        runs: &mut [Run],
+        state_only: impl Fn(usize) -> bool,
+    ) -> kinetic_cuda::Result<Vec<Ran>> {
         let mut out: Vec<Option<Ran>> = (0..runs.len()).map(|_| None).collect();
         let mut group: Vec<usize> = Vec::new();
         let mut rows = 0;
@@ -120,7 +136,7 @@ impl CudaModel<'_> {
                 members.sort_by_key(|(_, r)| r.state.id);
                 let (order, mut members): (Vec<usize>, Vec<&mut Run>) = members.into_iter().unzip();
                 let done = match &mut members[..] {
-                    [one] => vec![self.alone(one)?],
+                    [one] => vec![self.alone(one, false)?],
                     many => self.shared(many)?,
                 };
                 for (j, ran) in order.into_iter().zip(done) {
@@ -134,7 +150,7 @@ impl CudaModel<'_> {
                     group.push(i);
                     rows += r.tokens.len();
                 }
-                Some(r) => out[i] = Some(self.alone(r)?),
+                Some(r) => out[i] = Some(self.alone(r, state_only(i))?),
                 None => {}
             }
         }
@@ -157,8 +173,16 @@ impl CudaModel<'_> {
             && (state.checkpoint.is_none() || since + run.tokens.len() <= MAX_BATCH)
     }
 
-    fn alone(&self, run: &mut Run) -> kinetic_cuda::Result<Ran> {
-        let out = self.forward(run.state, run.tokens, run.all_rows, run.logits)?;
+    fn alone(&self, run: &mut Run, state_only: bool) -> kinetic_cuda::Result<Ran> {
+        let out = if state_only && self.advance_prompt_state(run.state, run.tokens)? {
+            Output {
+                greedy: Vec::new(),
+                hidden: Vec::new(),
+                logits: Vec::new(),
+            }
+        } else {
+            self.forward(run.state, run.tokens, run.all_rows, run.logits)?
+        };
         Ok(Ran {
             greedy: out.greedy,
             forward: Forward {
