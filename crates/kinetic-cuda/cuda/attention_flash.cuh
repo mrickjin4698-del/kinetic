@@ -3,9 +3,9 @@
 #include "attention.cuh"
 #include "mma.cuh"
 
-// Attention for large batches, flash style: a block of four warps takes 64
-// queries of one head and walks their keys in tiles through shared memory,
-// the next tile copied in while the current one is used, on f16 tensor
+// Attention for large batches, flash style: four warps take 64 queries
+// of a head. A block can take two heads sharing the same keys and values.
+// The next tile is copied in while the current one is used, on f16 tensor
 // cores with f32 sums and an online softmax, so no scores are stored. The
 // cached keys and values are f16 already, or widened to f16 from q8_0;
 // queries and attention weights enter as the sum of two f16 values, high
@@ -13,7 +13,8 @@
 // rotated, and keys and values cached, by `attn_prepare`; the gated result
 // goes to the f32 values of `out`, quantized afterwards.
 //
-// Warp w owns queries 16w..16w+15 as f16 A fragments, their high parts in
+// Within each head, warp w owns queries 16w..16w+15 as f16 A fragments,
+// their high parts in
 // registers and their low parts too, except for heads of 256, which keep
 // the low parts in shared memory. Heads of 512 fit neither: each block
 // takes half of the value dims, and the queries are split from f32 as each
@@ -39,11 +40,12 @@ __host__ __device__ constexpr bool flash_low_shared(unsigned hd) { return hd == 
 
 // Bytes of dynamic shared memory for head size `hd`: two tiles each of keys
 // and values, then any low parts of the queries.
-__host__ __device__ constexpr unsigned flash_shared(unsigned hd) {
+__host__ __device__ constexpr unsigned flash_shared(unsigned hd, unsigned heads) {
     return (2 * flash_keys(hd) * (2 * FLASH_PAD + hd + flash_values(hd)) +
-            (flash_low_shared(hd) ? FLASH_Q * (hd + FLASH_PAD) : 0)) *
+            (flash_low_shared(hd) ? heads * FLASH_Q * (hd + FLASH_PAD) : 0)) *
            2;
 }
+static_assert(flash_shared(256, 2) == 101376, "shared bytes for two query heads");
 
 // Copies values at..at + 8 of a cache into shared memory as f16: f16 rows
 // asynchronously, q8_0 rows widened on the way.
@@ -60,9 +62,11 @@ __device__ __forceinline__ void flash_load8(__half* dst, const void* cache, cons
     *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(h);
 }
 
-template <unsigned HD>
+template <unsigned HD, unsigned HEADS = 1>
 __device__ __forceinline__ void attn_flash_impl(const AttnArgs& a, unsigned n) {
     constexpr unsigned KV = flash_keys(HD), VD = flash_values(HD);
+    constexpr unsigned WARPS_PER_HEAD = FLASH_THREADS / WARP;
+    constexpr unsigned THREADS = HEADS * FLASH_THREADS;
     constexpr unsigned ROW = HD + FLASH_PAD, VROW = VD + FLASH_PAD;
     constexpr bool LOW_SHARED = flash_low_shared(HD), Q_SPLIT = VD < HD;
     extern __shared__ __align__(16) __half flash_smem[];
@@ -73,8 +77,10 @@ __device__ __forceinline__ void attn_flash_impl(const AttnArgs& a, unsigned n) {
 
     const unsigned warp = threadIdx.x / WARP, lane = threadIdx.x % WARP;
     const unsigned g = lane / 4, t = lane % 4;
-    const unsigned t0 = blockIdx.x * FLASH_Q, h = blockIdx.y, v0 = blockIdx.z * VD;
-    const unsigned kvh = h / (a.n_head / a.n_head_kv), kv_dim = a.n_head_kv * HD;
+    const unsigned t0 = blockIdx.x * FLASH_Q, h0 = blockIdx.y * HEADS, v0 = blockIdx.z * VD;
+    const unsigned h = h0 + warp / WARPS_PER_HEAD;
+    const unsigned warp_row = 16 * (warp % WARPS_PER_HEAD);
+    const unsigned kvh = h0 / (a.n_head / a.n_head_kv), kv_dim = a.n_head_kv * HD;
     const unsigned pos0 = a.batch[0];
     const unsigned last = min(t0 + FLASH_Q, n) - 1;
     // tiles start on multiples of KV whatever the batch's first position, so
@@ -86,11 +92,11 @@ __device__ __forceinline__ void attn_flash_impl(const AttnArgs& a, unsigned n) {
             const unsigned pos = min(max(k0 + row, seen), hi - 1);
             return static_cast<size_t>(attn_slot(a, pos)) * kv_dim + kvh * HD;
         };
-        for (unsigned i = threadIdx.x; i < KV * HD / 8; i += FLASH_THREADS) {
+        for (unsigned i = threadIdx.x; i < KV * HD / 8; i += THREADS) {
             const unsigned row = i / (HD / 8), col = 8 * (i % (HD / 8));
             flash_load8(&keys[buf][row][col], a.k_cache, a.k_scale, slot(row) + col);
         }
-        for (unsigned i = threadIdx.x; i < KV * VD / 8; i += FLASH_THREADS) {
+        for (unsigned i = threadIdx.x; i < KV * VD / 8; i += THREADS) {
             const unsigned row = i / (VD / 8), col = 8 * (i % (VD / 8));
             flash_load8(&values[buf][row][col], a.v_cache, a.v_scale, slot(row) + v0 + col);
         }
@@ -107,7 +113,7 @@ __device__ __forceinline__ void attn_flash_impl(const AttnArgs& a, unsigned n) {
     [[maybe_unused]] __half(*my_low)[ROW] = q_low + 16 * warp;
 #pragma unroll
     for (unsigned r = 0; r < 2; ++r) {
-        const unsigned tok = t0 + 16 * warp + g + 8 * r;
+        const unsigned tok = t0 + warp_row + g + 8 * r;
         qpos[r] = pos0 + tok;
         qstart[r] = attn_start(a, qpos[r]);
         const float* row = a.q + min(tok, n - 1) * a.q_stride + h * a.q_head_stride + 2 * t;
@@ -243,7 +249,7 @@ __device__ __forceinline__ void attn_flash_impl(const AttnArgs& a, unsigned n) {
 
 #pragma unroll
     for (unsigned r = 0; r < 2; ++r) {
-        const unsigned tok = t0 + 16 * warp + g + 8 * r;
+        const unsigned tok = t0 + warp_row + g + 8 * r;
         // Each lane summed the weights of its own columns.
         float sum = l[r] + __shfl_xor_sync(FULL_MASK, l[r], 1);
         sum += __shfl_xor_sync(FULL_MASK, sum, 2);
@@ -269,7 +275,7 @@ __device__ __forceinline__ void attn_flash_impl(const AttnArgs& a, unsigned n) {
 }
 
 // grid (ceil(n / FLASH_Q), n_head, head_dim / flash_values(head_dim)), block
-// FLASH_THREADS, flash_shared(head_dim) bytes of dynamic shared memory; `n`
+// FLASH_THREADS, flash_shared(head_dim, 1) bytes of dynamic shared memory; `n`
 // is the batch size.
 extern "C" __global__ void __launch_bounds__(FLASH_THREADS) attn_flash(AttnArgs a, unsigned n) {
     switch (a.head_dim) {
@@ -278,4 +284,10 @@ extern "C" __global__ void __launch_bounds__(FLASH_THREADS) attn_flash(AttnArgs 
         case 256: attn_flash_impl<256>(a, n); break;
         default: attn_flash_impl<512>(a, n); break;
     }
+}
+
+// grid (ceil(n / FLASH_Q), n_head / 2, 1). Each GQA group must have an
+// even number of query heads so each pair reads a single KV head.
+extern "C" __global__ void __launch_bounds__(2 * FLASH_THREADS) attn_flash_pair(AttnArgs a, unsigned n) {
+    attn_flash_impl<256, 2>(a, n);
 }

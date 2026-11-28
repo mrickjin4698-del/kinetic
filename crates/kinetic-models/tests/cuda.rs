@@ -295,7 +295,14 @@ fn prompt_cuts_change_no_bit() {
         bits(&logits)
     };
     let cold = run_cut(&[]);
-    for cuts in [&[96][..], &[32, 640], &[1024], &[1280], &[704, 1216, 1248]] {
+    for cuts in [
+        &[96][..],
+        &[32, 640],
+        &[256, 512, 768, 1024],
+        &[1024],
+        &[1280],
+        &[704, 1216, 1248],
+    ] {
         assert_eq!(run_cut(cuts), cold, "{cuts:?}");
     }
 }

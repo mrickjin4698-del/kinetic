@@ -32,6 +32,8 @@ const FLASH_PAD: usize = 8;
 
 /// Head sizes the flash kernel handles.
 pub(crate) const FLASH_HEADS: [usize; 4] = [64, 128, 256, 512];
+/// Head size of the two-head Flash Attention kernel.
+pub(crate) const FLASH_PAIR_DIM: usize = 256;
 /// Queries and threads per block of the f32 tile kernel, and the head sizes
 /// it handles; must match attention_tile.cuh.
 const TILE_QUERIES: u32 = 64;
@@ -50,9 +52,13 @@ fn flash_values(hd: usize) -> usize {
 /// Dynamic shared bytes of the flash kernel for heads of `hd`: two tiles
 /// each of keys and values, and for heads of 256 the low parts of the
 /// queries.
-pub(crate) fn flash_shared(hd: usize) -> u32 {
+pub(crate) fn flash_shared(hd: usize, heads_per_block: u32) -> u32 {
     let keys = if hd >= 256 { 16 } else { 32 };
-    let low = if hd == 256 { FLASH_QUERIES as usize } else { 0 };
+    let low = if hd == 256 {
+        (FLASH_QUERIES * heads_per_block) as usize
+    } else {
+        0
+    };
     let tiles = 2 * keys * (2 * FLASH_PAD + hd + flash_values(hd));
     ((tiles + low * (hd + FLASH_PAD)) * 2) as u32
 }
@@ -619,19 +625,41 @@ impl Kernels {
                 return Ok(());
             }
             if flash {
+                let query_blocks = n.div_ceil(FLASH_QUERIES);
+                let paired = self.attn_flash_pair.as_ref().filter(|_| {
+                    if hd != FLASH_PAIR_DIM
+                        || s.window.is_some()
+                        || k_scale != 0
+                        || v_scale != 0
+                        || !(s.n_head / s.n_head_kv).is_multiple_of(2)
+                    {
+                        return false;
+                    }
+                    // Paired blocks run more warps and use more shared memory.
+                    // They win when they halve the number of waves over the SMs.
+                    let blocks = query_blocks * heads;
+                    let sms = self.multiprocessors;
+                    blocks.div_ceil(sms) == 2 * (blocks / 2).div_ceil(sms)
+                });
+                let (kernel, heads_per_block) = match paired {
+                    Some(kernel) => (kernel, 2),
+                    None => {
+                        let kernel = self.attn_flash.as_ref().ok_or_else(|| {
+                            Error::Shape(format!("{n} tokens in one pass need the flash kernel"))
+                        })?;
+                        (kernel, 1)
+                    }
+                };
                 let config = LaunchConfig {
                     grid: [
-                        n.div_ceil(FLASH_QUERIES),
-                        heads,
+                        query_blocks,
+                        heads / heads_per_block,
                         (hd / flash_values(hd)) as u32,
                     ],
-                    block: [FLASH_THREADS, 1, 1],
-                    shared_bytes: flash_shared(hd),
+                    block: [FLASH_THREADS * heads_per_block, 1, 1],
+                    shared_bytes: flash_shared(hd, heads_per_block),
                 };
-                let flash = self.attn_flash.as_ref().ok_or_else(|| {
-                    Error::Shape(format!("{n} tokens in one pass need the flash kernel"))
-                })?;
-                flash.launch(config, stream, &mut [arg(&args), arg(&n)])?;
+                kernel.launch(config, stream, &mut [arg(&args), arg(&n)])?;
                 return io.out.quantize(self, n as usize, stream);
             }
             if let Some(tile) = tile {

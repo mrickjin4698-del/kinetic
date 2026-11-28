@@ -1,7 +1,7 @@
 use std::ffi::{c_void, CStr, CString};
 use std::rc::Rc;
 
-use crate::attention::{flash_shared, FLASH_HEADS};
+use crate::attention::{flash_shared, FLASH_HEADS, FLASH_PAIR_DIM};
 use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::gemm::gemm_functions;
@@ -59,6 +59,8 @@ pub struct Kernels {
     /// Attention for batches larger than [`MAX_BATCH`], where the device has
     /// the shared memory it needs.
     pub(crate) attn_flash: Option<Function>,
+    /// Flash Attention over a pair of query heads of one KV head.
+    pub(crate) attn_flash_pair: Option<Function>,
     /// The same in f32 without tensor cores, for heads of 128 to 512.
     pub(crate) attn_tile: Option<Function>,
     pub(crate) attn_combine: Function,
@@ -136,9 +138,23 @@ impl Kernels {
         let attn_flash = module.function(c"attn_flash")?;
         let attn_flash = (tensor_cores
             && attn_flash
-                .allow_shared(FLASH_HEADS.into_iter().map(flash_shared).max().unwrap_or(0))
+                .allow_shared(
+                    FLASH_HEADS
+                        .into_iter()
+                        .map(|hd| flash_shared(hd, 1))
+                        .max()
+                        .unwrap_or(0),
+                )
                 .is_ok())
         .then_some(attn_flash);
+        let attn_flash_pair = if info.compute_capability == (12, 0) && attn_flash.is_some() {
+            let pair = module.function(c"attn_flash_pair")?;
+            pair.allow_shared(flash_shared(FLASH_PAIR_DIM, 2))
+                .is_ok()
+                .then_some(pair)
+        } else {
+            None
+        };
         let attn_tile = (!tensor_cores)
             .then(|| module.function(c"attn_tile"))
             .transpose()?;
@@ -184,6 +200,7 @@ impl Kernels {
                 module.function(c"attn_chunk_2")?,
             ],
             attn_flash,
+            attn_flash_pair,
             attn_tile,
             attn_combine: module.function(c"attn_combine")?,
             attn_copy_kv: module.function(c"attn_copy_kv")?,
